@@ -642,6 +642,28 @@ def plot_density_streamplot(
 
     return ax, contours
 
+
+# Figures this script draws, each named after the file it writes. Selected with
+# `plots=[...]` on the command line; the default is the set the paper uses.
+FIGURES = ('single', 'time_snapshots', 'platform_snapshots', 'trajectories',
+           'landscapes', 'animation')
+DEFAULT_FIGURES = ('single', 'time_snapshots', 'trajectories')
+
+
+def wanted(cfg):
+    """The figures cfg asks for.
+
+    An unrecognised name raises rather than drawing nothing: asking for one
+    figure is what you do because the run is long, and a typo that quietly
+    produced no output would only show up at the end of it.
+    """
+    names = set(cfg.get('plots', DEFAULT_FIGURES))
+    unknown = sorted(names - set(FIGURES))
+    if unknown:
+        raise ValueError(f'unknown plots {unknown}; choose from {list(FIGURES)}')
+    return names
+
+
 @hydra.main(version_base=None, config_path="../../config", config_name="config")
 def main(cfg):
     # Whatever cfg.latents.method says the model was trained on. The helpers
@@ -679,13 +701,7 @@ def main(cfg):
     fig_path = f'./figs/{trend_name}'
     os.makedirs(fig_path, exist_ok=True)
 
-    # The platform panel needs one model per platform, trained separately.
-    PLOT_ANI = False
-    PLOT_TIME = True
-    PLOT_PLATFORM = False
-    PLOT_TRAJECTORIES = True
-    PLOT_POTENTIAL_LANDSCAPES = False
-    PLOT_SINGLE = True
+    plots = wanted(cfg)
 
     state_path = sweep_runs.state_path(run_dir(cfg))
     model, _ = DeepTimePhiPLNN.load(state_path, dtype=dtype)
@@ -721,14 +737,14 @@ def main(cfg):
 
     PLATFORMS = ['twitter', 'tiktok', 'instagram', 'bluesky']
 
-    if PLOT_ANI:
+    if 'animation' in plots:
         animate_density_streamplot(fig_path, model, target_df, components, coords, stance_cols, **plot_kwargs)
 
-    if PLOT_SINGLE:
+    if 'single' in plots:
         figure_density_streamplot(fig_path, model, target_df, components, stance_cols, **plot_kwargs)
     
 
-    if PLOT_TIME:
+    if 'time_snapshots' in plots:
         years = [2023, 2024, 2025]
         fig, axes = plt.subplots(1, 3, figsize=(12, 4.5))
 
@@ -790,7 +806,7 @@ def main(cfg):
 
         fig.savefig(f'{fig_path}/nn_potential_density_streamplot_time_snapshots.png', bbox_inches='tight', dpi=150, pad_inches=0)
 
-    if PLOT_PLATFORM:
+    if 'platform_snapshots' in plots:
         platform_pretty = {
             'twitter': 'Twitter',
             'tiktok': 'TikTok',
@@ -885,7 +901,7 @@ def main(cfg):
 
     NUM_DIMS = cfg.n_dims
 
-    if (PLOT_TRAJECTORIES or PLOT_POTENTIAL_LANDSCAPES) \
+    if (plots & {'trajectories', 'landscapes'}) \
             and cfg.latents.method != 'gpfa':
         n_dims = cfg.n_dims
         target_df = target_df.sort(['filter_value', 'createtime']) \
@@ -899,10 +915,10 @@ def main(cfg):
             ) \
             .drop([f'dim_{i}' for i in range(n_dims)])
 
-    if PLOT_TRAJECTORIES or PLOT_POTENTIAL_LANDSCAPES:
+    if plots & {'trajectories', 'landscapes'}:
         target_df = filter_df_to_time_range(target_df, trange)
 
-    if PLOT_TRAJECTORIES:
+    if 'trajectories' in plots:
         fig, ax = plt.subplots(1, 1, figsize=(6, 6))
 
         for user_target_df in target_df.partition_by('filter_value'):
@@ -927,7 +943,7 @@ def main(cfg):
 
         fig.savefig(f'{fig_path}/nn_potential_trajectories.png', dpi=150, bbox_inches='tight', pad_inches=0.2)
 
-    if PLOT_POTENTIAL_LANDSCAPES and NUM_DIMS >= 3:
+    if 'landscapes' in plots and NUM_DIMS >= 3:
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
         dim_configs = [(0, 1), (0, 2), (1, 2)]
