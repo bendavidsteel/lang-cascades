@@ -638,7 +638,8 @@ def plot_density_streamplot(
 
     # Add legend (conditionally)
     if show_legend:
-        add_legend(ax, flow_percentiles=flow_percentiles)
+        add_legend(ax, flow_percentiles=flow_percentiles,
+                   show_hatching=show_hatching)
 
     return ax, contours
 
@@ -733,6 +734,10 @@ def main(cfg):
         'n_marginal': 256,
         'n_dims': cfg.n_dims,
         'target_weights': target_weights,
+        # the landscape figures show the flow field alone: the density and the
+        # uncertainty hatching sit on top of the streamlines and hide them
+        'show_kde': False,
+        'show_hatching': False,
     }
 
     PLATFORMS = ['twitter', 'tiktok', 'instagram', 'bluesky']
@@ -786,9 +791,6 @@ def main(cfg):
             plot_kwargs['show_y_axis_labels'] = (i == 0)
             plot_kwargs['show_x_tick_labels'] = True
             plot_kwargs['show_y_tick_labels'] = (i == 0)
-            # the density is what changes between years; the flow barely does
-            plot_kwargs['show_kde'] = True
-            plot_kwargs['show_hatching'] = False
             plot_density_streamplot(fig, axes[i], model, target_df, components, stance_cols, **plot_kwargs)
             axes[i].set_title(f'{t_to_datetime(t_range[0]).strftime("%Y")}')
 
@@ -876,8 +878,6 @@ def main(cfg):
             platform_plot_kwargs['show_y_tick_labels'] = (i == 0)
             platform_plot_kwargs['show_x_axis_labels'] = True
             platform_plot_kwargs['show_y_axis_labels'] = (i == 0)
-            platform_plot_kwargs['show_kde'] = False
-            platform_plot_kwargs['show_hatching'] = False
 
             plot_density_streamplot(
                 fig, axes[i], platform_model, platform_df, components, stance_cols,
