@@ -84,6 +84,19 @@ def name(cfg):
     return 'gpfa' if cfg.latents.method == 'gpfa' else cfg.dim_reduction_method
 
 
+def dimension_labels_path(cfg):
+    """Where the labels naming this representation's dimensions live.
+
+    Beside the fit for a gpfa latent: `name` alone does not tell two fits
+    apart, and a shared file captions one fit's axes with another's names. The
+    precomputed methods keep theirs under the trend, where the basis is fixed
+    per method.
+    """
+    if cfg.latents.method == 'gpfa':
+        return os.path.join(latent_dir(cfg), 'dimension_labels.json')
+    return os.path.join(cfg.trend_path, f'{name(cfg)}_dimension_labels.json')
+
+
 def target_volumes(cfg, targets):
     """Posts behind each target, for weighting a loading ranking.
 

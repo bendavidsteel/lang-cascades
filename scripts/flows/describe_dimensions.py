@@ -435,7 +435,7 @@ def main(cfg):
         dimension_labels[dim]['variance_of_derivative'] = float(coord_diff_var[dim])
 
     # Save dimension labels to file
-    dim_label_path = os.path.join(trend_path, f'{latent_space.name(cfg)}_dimension_labels.json')
+    dim_label_path = latent_space.dimension_labels_path(cfg)
     with open(dim_label_path, 'w') as f:
         json.dump(dimension_labels, f, indent=2)
 

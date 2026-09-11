@@ -685,7 +685,7 @@ def main(cfg):
     # Load dimension labels if available
     trend_path = cfg.trend_path
     trend_name = os.path.basename(trend_path.rstrip('/'))
-    dimension_labels_path = os.path.join(trend_path, f'{latent_space.name(cfg)}_dimension_labels.json')
+    dimension_labels_path = latent_space.dimension_labels_path(cfg)
     dimension_labels = load_dimension_labels(dimension_labels_path)
 
     # with jax.default_device(jax.devices("cpu")[0]):
