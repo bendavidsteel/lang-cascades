@@ -657,17 +657,12 @@ def load_latents(cfg, spec, log=print):
     """
     import latent_space
     from latent_gp import LatentConfig, build_latents, coord_cols
-    from latent_gp import cells as gp_cells
 
-    lcfg = dataclasses.replace(LatentConfig.from_cfg(cfg), interp_days=0.0)
-    seed_split = splits.seed_split(gp_cells.seed_names(lcfg.cells_path), spec)
-    df = build_latents(lcfg, spec, seed_split, cache_root=latent_space.latent_root(cfg),
-                       log=log)
+    lcfg, _, kw = latent_space.fit_args(
+        cfg, dataclasses.replace(LatentConfig.from_cfg(cfg), interp_days=0.0), spec)
+    df = build_latents(lcfg, spec, **dict(kw, log=log))
     smoothed, causal, sd = coord_cols(cfg.n_dims)
-    if cfg.platform != 'all':
-        df = df.filter(pl.col('filter_value').cast(pl.String)
-                       .str.to_lowercase().str.contains(f'-{cfg.platform}-'))
-    df = df.filter(pl.col('filter_value') != '') \
+    df = latent_space.keep_platform(cfg, df).filter(pl.col('filter_value') != '') \
            .select(['createtime', 'filter_value', causal, smoothed, sd]) \
            .sort(['filter_value', 'createtime'])
     return df, causal, smoothed, sd, 2.0 * lcfg.bin_factor

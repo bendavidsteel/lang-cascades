@@ -16,8 +16,7 @@ from tqdm import tqdm
 
 import latent_space
 import splits
-from latent_gp import LatentConfig, build_latents, coord_cols
-from latent_gp import cells as gp_cells
+from latent_gp import LatentConfig
 
 from plnn.dataset import LandscapeSimulationDataset, NumpyLoader
 from plnn.models import DeepTimePhiPLNN
@@ -135,14 +134,7 @@ def load_target_df(cfg):
     target_df = pl.read_parquet(target_path)
     coord_col = [c for c in target_df.columns if c.startswith('coord_')][0]
 
-    if cfg.platform != 'all':
-        target_df = target_df.filter(
-            pl.col('filter_value').cast(pl.String)\
-                .str.to_lowercase()\
-                .str.contains(f'-{cfg.platform}-')
-        )
-
-    target_df = target_df.filter(pl.col('filter_value') != '')
+    target_df = latent_space.keep_platform(cfg, target_df).filter(pl.col('filter_value') != '')
     target_df = target_df.select(['createtime', 'filter_value', coord_col])\
         .sort(['filter_value', 'createtime'])\
         .rename({coord_col: 'x0'})
@@ -206,20 +198,9 @@ def load_latent_df(cfg, spec):
     if cfg.latents.method != 'gpfa':
         return load_target_df(cfg)
 
-    lcfg = LatentConfig.from_cfg(cfg)
-    seed_split = splits.seed_split(gp_cells.seed_names(lcfg.cells_path), spec)
-    df = build_latents(lcfg, spec, seed_split,
-                       cache_root=latent_space.latent_root(cfg), log=logger.info)
-
-    coord, causal, _ = coord_cols(cfg.n_dims)
-    state = causal if cfg.latents.causal_state else coord
-    if cfg.platform != 'all':
-        df = df.filter(pl.col('filter_value').cast(pl.String)
-                       .str.to_lowercase().str.contains(f'-{cfg.platform}-'))
-    return df.filter(pl.col('filter_value') != '')\
-        .select(['createtime', 'filter_value', state])\
-        .sort(['filter_value', 'createtime'])\
-        .rename({state: 'x0'})
+    df, _, _ = latent_space.load(cfg, spec=spec)
+    return latent_space.keep_platform(cfg, df).filter(pl.col('filter_value') != '')\
+        .rename({latent_space.COORD: 'x0'})
 
 
 # Everything that changes the trained landscape. Eval-only settings are left
@@ -319,20 +300,21 @@ def compute_training_split(cfg, target_df=None):
 
 
 def apply_split(df, split_type, train_fraction, val_filter_values=None,
-                cutoff_time=None, spec=None, scenario='val_out'):
+                cutoff_time=None, spec=None, scenario='val_out', key=None):
     """Split df into train/val using metadata from compute_training_split.
 
     For 'random', shuffles df with seed=42 then takes head/tail.
     For 'filter_value' / 'time', filters df by val_filter_values / cutoff_time.
     For 'nested', `spec` and `scenario` select one cell of the trajectory x time
-    design; the returned 'val' half is that cell.
+    design; the returned 'val' half is that cell, and `key` is the split key
+    (see splits.assign_trajectory_split).
     """
     if split_type == 'nested':
         if spec is None:
             raise ValueError("split_type='nested' requires a SplitSpec")
         time_col = ('future_createtime' if 'future_createtime' in df.columns
                     else 'next_createtime')
-        labelled = splits.label_pairs(df, spec, time_col=time_col)
+        labelled = splits.label_pairs(df, spec, time_col=time_col, key=key)
         traj, time = scenario.rsplit('_', 1)
         return splits.training_rows(labelled), splits.select(labelled, traj, time)
     if split_type == 'random':
@@ -356,12 +338,18 @@ def apply_split(df, split_type, train_fraction, val_filter_values=None,
 
 
 def load_seed_metadata(cfg):
-    """Load seed metadata (MainType, Party) from the stance data."""
+    """Load seed metadata (MainType, Party) from the stance data.
+
+    Keyed by whatever a trajectory is, so a handle-keyed run's breakdowns join
+    rather than coming back all null.
+    """
+    traj_col = LatentConfig.from_cfg(cfg).traj_col \
+        if cfg.latents.method == 'gpfa' else 'SeedName'
     dir_path = cfg.base_stance_path
     file_paths = [os.path.join(dir_path, f) for f in os.listdir(dir_path) if f.endswith('.parquet.zstd')]
     df = pl.read_parquet(file_paths, columns=['seed'])
     return df.select([
-        pl.col('seed').struct.field('SeedName'),
+        pl.col('seed').struct.field(traj_col).alias('SeedName'),
         pl.col('seed').struct.field('MainType'),
         pl.col('seed').struct.field('SubType'),
         pl.col('seed').struct.field('Party'),
@@ -746,7 +734,9 @@ def main(cfg):
     pairs = build_training_pairs(
         cfg, target_df, smooth=smooth,
         max_step_days=10 if smooth else 1.5 * grid_days)
-    labelled = splits.label_pairs(pairs, spec, time_col='next_createtime')
+    split_key = latent_space.split_key(cfg)
+    labelled = splits.label_pairs(pairs, spec, time_col='next_createtime',
+                                  key=split_key)
     logger.info('pair counts by scenario:\n' + str(splits.summarise(labelled)))
 
     train_df = splits.training_rows(labelled)
@@ -866,7 +856,8 @@ def main(cfg):
             continue
         prefix = f'horizon_{horizon_days}d'
         scored[prefix] = evaluate_scenarios(
-            model, splits.label_pairs(paired, spec, time_col='future_createtime'),
+            model, splits.label_pairs(paired, spec, time_col='future_createtime',
+                                      key=split_key),
             cfg, evalkey, n_dims, seed_df, prefix=prefix)
         write_scenario_metrics(scored[prefix], cfg, dir_path, prefix)
 

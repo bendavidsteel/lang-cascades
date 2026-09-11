@@ -37,10 +37,10 @@ def _stub(monkey_built):
     def _pairs(s_path, p_path):
         return open(s_path).read()
 
-    def _aggregate_week(pairs, resolution):
+    def _aggregate_week(pairs, resolution, keys=('SeedName',)):
         monkey_built.append(pairs)
-        return pl.DataFrame({'SeedName': ['s'], 'target': ['t'],
-                             'bin': [1], 'n': [float(len(pairs))]})
+        return pl.DataFrame({k: ['s'] for k in keys}
+                            | {'target': ['t'], 'bin': [1], 'n': [float(len(pairs))]})
     return _pairs, _aggregate_week
 
 
@@ -102,11 +102,46 @@ def main():
     finally:
         agg._pairs, agg._aggregate_week = real
 
+    check_handle_key()
     print('\nall aggregate rebuild checks passed')
+
+
+def check_handle_key():
+    """A handle-keyed merge must sum within a handle and keep the seed.
+
+    Summing on the seed alone would put both of a person's accounts in one cell,
+    which is the aggregate the platform landscapes exist to avoid.
+    """
+    keys = agg.traj_keys('PlatformHandleID')
+    assert keys == ('PlatformHandleID', 'SeedName'), keys
+
+    with tempfile.TemporaryDirectory() as td:
+        parts = os.path.join(td, 'parts')
+        os.makedirs(parts)
+        for i in range(2):
+            pl.DataFrame({
+                'PlatformHandleID': ['1-twitter-a', '2-tiktok-a'],
+                'SeedName': ['a', 'a'], 'target': ['t', 't'],
+                'bin': [1, 1], 'n': [1.0, 2.0],
+            }).write_parquet(os.path.join(parts, f'{i}_cells.parquet.zstd'),
+                             compression='zstd')
+
+        cache = os.path.join(td, 'handles.parquet.zstd')
+        agg.merge_parts(parts, cache, keys, log=lambda *a: None)
+        got = pl.read_parquet(cache).sort('PlatformHandleID')
+
+    assert got['PlatformHandleID'].to_list() == ['1-twitter-a', '2-tiktok-a']
+    assert got['SeedName'].to_list() == ['a', 'a']
+    assert got['n'].to_list() == [2.0, 4.0], got['n'].to_list()
+    print('handle-keyed merge: one row per handle, seed carried through')
 
 
 def test_aggregate_rebuilds():
     main()
+
+
+def test_handle_key():
+    check_handle_key()
 
 
 if __name__ == '__main__':

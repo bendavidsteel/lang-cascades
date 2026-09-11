@@ -2,7 +2,9 @@
 
 Trajectories are split train/val/test by a hash of their id rather than by
 position in a shuffled list, so the assignment survives any upstream filtering
-(platform, minimum volume) instead of shifting when the seed set changes.
+(platform, minimum volume) instead of shifting when the seed set changes. A run
+whose trajectories are platform handles passes a `key` mapping each handle to
+its seed, so both sides of the boundary agree on whole people.
 
 Time is split by a holdout window. A pair counts as out-of-time when its
 *target* t1 falls in the holdout, which is what keeps every training target
@@ -98,19 +100,24 @@ def _unit_hash(values, seed):
     return out
 
 
-def assign_trajectory_split(filter_values, spec):
-    """Map each trajectory id to 'train' / 'val' / 'test'."""
+def assign_trajectory_split(filter_values, spec, key=None):
+    """Map each trajectory id to 'train' / 'val' / 'test'.
+
+    `key` maps an id to the id whose hash decides it, which is how a run over
+    platform handles puts every handle of a seed in the same cell as the seed.
+    """
     values = sorted(set(str(v) for v in filter_values))
-    u = _unit_hash(values, spec.seed)
+    hashed = [key.get(v, v) for v in values] if key else values
+    u = _unit_hash(hashed, spec.seed)
     label = np.where(
         u < spec.train_frac, 'train',
         np.where(u < spec.train_frac + spec.val_frac, 'val', 'test'))
     return pl.DataFrame({'filter_value': values, 'traj_split': label})
 
 
-def seed_split(filter_values, spec):
+def seed_split(filter_values, spec, key=None):
     """`assign_trajectory_split` as the id -> split dict the latent fit takes."""
-    traj = assign_trajectory_split(filter_values, spec)
+    traj = assign_trajectory_split(filter_values, spec, key)
     return dict(zip(traj['filter_value'].to_list(), traj['traj_split'].to_list()))
 
 
@@ -130,7 +137,8 @@ def time_cutoff(times, spec):
     return time_window(times, spec)[0]
 
 
-def label_pairs(pairs, spec, cutoff=None, time_col='future_createtime', end=None):
+def label_pairs(pairs, spec, cutoff=None, time_col='future_createtime', end=None,
+                key=None):
     """Stamp traj_split and time_split onto a (t0, x0, t1, x1) frame.
 
     time_split keys off the pair's target time, so a pair that starts before
@@ -145,7 +153,7 @@ def label_pairs(pairs, spec, cutoff=None, time_col='future_createtime', end=None
     cutoff = auto_cutoff if cutoff is None else cutoff
     end = auto_end if end is None else end
 
-    traj = assign_trajectory_split(pairs['filter_value'].unique().to_list(), spec)
+    traj = assign_trajectory_split(pairs['filter_value'].unique().to_list(), spec, key)
     return pairs.filter(pl.col(time_col) <= end) \
         .with_columns(pl.col('filter_value').cast(pl.String)) \
         .join(traj, on='filter_value', how='left') \

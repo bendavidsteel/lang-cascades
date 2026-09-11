@@ -6,6 +6,11 @@ the loadings come out of that same fit, so they describe the axes the
 trajectories actually move along. The precomputed methods read coords and a
 component matrix written over the whole dataset.
 
+With `cfg.latents.ref_cells_path` set the fit is a projection: the trajectories
+come from a second aggregate -- one per platform handle rather than one per
+seed -- and the axes from the pooled fit over the first. That is what lets a
+platform-specific landscape be read against the pooled one; see latent_gp.
+
 Loadings are returned (K, J) with the target names indexing the columns, which
 is how PCA components arrive and so what code written against them expects.
 """
@@ -19,7 +24,7 @@ import polars as pl
 
 import splits
 from latent_gp import (LatentConfig, build_latents, build_loadings, coord_cols,
-                       fit_dir, loading_matrix)
+                       fit_dir, loading_matrix, reference)
 from latent_gp import cells as gp_cells
 
 logger = logging.getLogger(__name__)
@@ -56,15 +61,17 @@ PRECOMPUTED_START = datetime.datetime(2022, 1, 1)
 TOP_TARGETS = 10
 
 
-def load(cfg, smooth=True):
+def load(cfg, smooth=True, spec=None):
     """Returns (trajectories, (K, J) loadings, target names).
 
     The gpfa latent is smooth in time by construction, so `smooth` only ever
     applies to the precomputed coords -- averaging the latent again would just
     widen the window each point already covers.
+
+    `spec` overrides the split cfg implies, for a fold at a rolled-back origin.
     """
     if cfg.latents.method == 'gpfa':
-        return _gpfa(cfg)
+        return _gpfa(cfg, spec)
     return _precomputed(cfg, smooth)
 
 
@@ -148,27 +155,71 @@ def dimension_quality(cfg, n_top=TOP_TARGETS):
     """ranking_quality for the fit cfg names, off the loadings it cached."""
     if cfg.latents.method != 'gpfa':
         return {}
-    spec = splits.SplitSpec.from_cfg(cfg)
-    lcfg = LatentConfig.from_cfg(cfg)
-    seed_split = splits.seed_split(gp_cells.seed_names(lcfg.cells_path), spec)
-    components, targets = loading_matrix(build_loadings(
-        lcfg, spec, seed_split, cache_root=latent_root(cfg), log=logger.info))
+    lcfg, spec, kw = fit_args(cfg)
+    components, targets = loading_matrix(build_loadings(lcfg, spec, **kw))
     return ranking_quality(components, target_volumes(cfg, targets), n_top)
 
 
-def _gpfa(cfg):
-    spec = splits.SplitSpec.from_cfg(cfg)
+def keep_platform(cfg, df):
+    """Trajectories belonging to cfg.platform, or all of them when 'all'.
+
+    A trajectory names its platform only when it is one account rather than one
+    person, so asking for a platform of a seed-keyed run selects nothing at all;
+    that is a misconfiguration, not an empty result.
+    """
+    if cfg.platform == 'all':
+        return df
+    kept = df.filter(pl.col('filter_value').cast(pl.String)
+                     .str.to_lowercase().str.contains(f'-{cfg.platform}-'))
+    if len(kept) == 0:
+        raise ValueError(
+            f'no trajectory names platform {cfg.platform!r}: a platform run '
+            'needs a handle-keyed representation, not a seed-keyed one')
+    return kept
+
+
+def split_key(cfg):
+    """Trajectory id -> the id whose hash decides its train/val/test cell.
+
+    None unless the run is keyed by platform handle, where it maps each handle
+    back to its seed: the axes were fitted over whole seeds, so a handle has to
+    land on the same side of the boundary as the rest of that person.
+    """
+    if cfg.latents.method != 'gpfa':
+        return None
     lcfg = LatentConfig.from_cfg(cfg)
-    seed_split = splits.seed_split(gp_cells.seed_names(lcfg.cells_path), spec)
-    kw = dict(cache_root=latent_root(cfg), log=logger.info)
+    return gp_cells.traj_seeds(lcfg.cells_path, lcfg.traj_col)
+
+
+def fit_args(cfg, lcfg=None, spec=None):
+    """(lcfg, spec, keyword arguments) every build_* call for this cfg takes.
+
+    `lcfg` and `spec` override the ones cfg implies, for a caller that wants the
+    same fit under one changed field or at a rolled-back origin.
+    """
+    spec = splits.SplitSpec.from_cfg(cfg) if spec is None else spec
+    lcfg = LatentConfig.from_cfg(cfg) if lcfg is None else lcfg
+    kw = dict(cache_root=latent_root(cfg), log=logger.info,
+              seed_split=splits.seed_split(
+                  gp_cells.seed_names(lcfg.cells_path, lcfg.traj_col), spec,
+                  key=split_key(cfg)))
+    ref = reference(lcfg)
+    if ref is not None:
+        kw['ref_seed_split'] = splits.seed_split(
+            gp_cells.seed_names(ref.cells_path), spec)
+    return lcfg, spec, kw
+
+
+def _gpfa(cfg, spec=None):
+    lcfg, spec, kw = fit_args(cfg, spec=spec)
 
     coord, causal, _ = coord_cols(lcfg.n_dims)
     state = causal if cfg.latents.causal_state else coord
-    target_df = build_latents(lcfg, spec, seed_split, **kw) \
+    target_df = build_latents(lcfg, spec, **kw) \
         .select(['createtime', 'filter_value', pl.col(state).alias(COORD)]) \
         .sort(['filter_value', 'createtime'])
 
-    components, targets = loading_matrix(build_loadings(lcfg, spec, seed_split, **kw))
+    components, targets = loading_matrix(build_loadings(lcfg, spec, **kw))
     return target_df, components, targets
 
 

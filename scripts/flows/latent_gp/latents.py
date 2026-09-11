@@ -26,6 +26,11 @@ window's end, so neither state sees past the period being scored.
 its label ('hard'), its label through a measured error channel ('channel'), or
 its probabilities as expected counts ('soft'). See probs.py, and calibrate.py
 for the channel.
+
+`ref_cells_path` makes the fit a projection: W, b and c are taken from the fit
+of the same configuration on that aggregate and only z is inferred here, so a
+second aggregate -- one trajectory per platform handle rather than per seed --
+lands in the axes the pooled fit defined instead of in its own.
 """
 
 import dataclasses
@@ -67,6 +72,8 @@ class LatentConfig:
     prob_floor: float = 0.01        # uniform mass mixed into each lattice point
     calibration_path: str = ''      # calibrate.py output; required by 'channel'
     w_ridge: float = W_RIDGE_OFF    # prior precision on the loadings
+    traj_col: str = cells.SEED_COL  # column of cells_path a trajectory is one of
+    ref_cells_path: str = ''        # fit W, b, c over this aggregate instead
     seed: int = 0
 
     def __post_init__(self):
@@ -102,6 +109,8 @@ class LatentConfig:
             prob_floor=cfg.latents.prob_floor,
             calibration_path=cfg.latents.calibration_path,
             w_ridge=cfg.latents.get('w_ridge', W_RIDGE_OFF),
+            traj_col=cfg.latents.get('traj_col', cells.SEED_COL),
+            ref_cells_path=cfg.latents.get('ref_cells_path', ''),
             seed=cfg.latents.seed,
         )
 
@@ -113,17 +122,19 @@ class LatentConfig:
         varying a probability setting still hits the cache on the trials that
         ignore it, instead of refitting the same latents under a new key.
         """
-        skip = ({'cells_path'} | _unused_by(self.obs_model)
+        skip = ({'cells_path', 'ref_cells_path'} | _unused_by(self.obs_model)
                 | _unused_by_mix(self.n_fast, self.n_dims, self.slow_kind))
         if self.w_ridge == W_RIDGE_OFF:
             skip = skip | {'w_ridge'}   # every fit that predates the prior
+        if self.traj_col == cells.SEED_COL:
+            skip = skip | {'traj_col'}  # every fit that predates the handle key
         body = '|'.join(f'{f.name}={getattr(self, f.name)}'
                         for f in dataclasses.fields(self) if f.name not in skip)
         return hashlib.blake2b(body.encode(), digest_size=6).hexdigest()
 
 
-# the two frames one fit produces, as indices into what _fit returns
-LATENTS, LOADINGS = 0, 1
+# what one fit produces, as indices into what _fit returns
+LATENTS, LOADINGS, PARAMS = 0, 1, 2
 
 OBS_MODELS = ('hard', 'channel', 'soft')
 _PROB_FIELDS = frozenset({'obs_temperature', 'prob_resolution', 'prob_floor'})
@@ -236,7 +247,15 @@ def _loading_frame(meta, W, b, mu, sd):
     })
 
 
-LATENTS_FILE, LOADINGS_FILE = 'latents.parquet.zstd', 'loadings.parquet.zstd'
+FILES = ('latents.parquet.zstd', 'loadings.parquet.zstd', 'params.json')
+
+
+def reference(lcfg):
+    """The pooled configuration a projection borrows its axes from, or None."""
+    if not lcfg.ref_cells_path:
+        return None
+    return dataclasses.replace(lcfg, cells_path=lcfg.ref_cells_path,
+                               ref_cells_path='', traj_col=cells.SEED_COL)
 
 
 def fit_dir(root, lcfg, spec):
@@ -245,57 +264,104 @@ def fit_dir(root, lcfg, spec):
     A directory rather than a keyed filename so that whatever is derived from
     the fit -- the landscape model above all -- is stored beside the frames it
     was derived from. cells_path is in the key because lcfg.tag deliberately
-    omits it, so two aggregates would otherwise share a directory.
+    omits it, so two aggregates would otherwise share a directory; a projection
+    names the aggregate it took its parameters from for the same reason.
     """
     if not root:
         return None
+    ref = reference(lcfg)
+    on = f'_on{data_tag(ref.cells_path)}' if ref else ''
     return os.path.join(
-        root, f'gpfa{lcfg.tag}_{data_tag(lcfg.cells_path)}_{spec.tag}')
+        root, f'gpfa{lcfg.tag}_{data_tag(lcfg.cells_path)}{on}_{spec.tag}')
 
 
 def _cache_paths(lcfg, spec, cache_root):
-    """Where this configuration's latents and loadings live, or (None, None)."""
+    """Where this configuration's outputs live, or a tuple of Nones."""
     d = fit_dir(cache_root, lcfg, spec)
     if d is None:
-        return None, None
-    return os.path.join(d, LATENTS_FILE), os.path.join(d, LOADINGS_FILE)
+        return (None,) * len(FILES)
+    return tuple(os.path.join(d, f) for f in FILES)
 
 
-def build_latents(lcfg, spec, seed_split, cache_root=None, log=print):
+def _read(path, want):
+    if want == PARAMS:
+        with open(path) as fh:
+            return json.load(fh)
+    return pl.read_parquet(path)
+
+
+def _write(path, obj, want):
+    if want == PARAMS:
+        with open(path, 'w') as fh:
+            json.dump(obj, fh, indent=1)
+    else:
+        obj.write_parquet(path, compression='zstd')
+
+
+def build_latents(lcfg, spec, seed_split, cache_root=None, log=print,
+                  ref_seed_split=None):
     """Fit the latent-GP factor model under `spec` and return per-bin states.
 
     `seed_split` maps trajectory id -> 'train' / 'val' / 'test'. Returns a frame
     of (createtime, filter_value, coord, causal coord, posterior sd, n_posts).
+
+    `ref_seed_split` is the same map over the reference aggregate's seeds, and
+    is required when `lcfg` names one.
     """
-    return _build(lcfg, spec, seed_split, cache_root, log, LATENTS)
+    return _build(lcfg, spec, seed_split, cache_root, log, LATENTS, ref_seed_split)
 
 
-def build_loadings(lcfg, spec, seed_split, cache_root=None, log=print):
+def build_loadings(lcfg, spec, seed_split, cache_root=None, log=print,
+                   ref_seed_split=None):
     """Per-target loadings from the same fit: (target, loading, intercept).
 
     One row per target surviving min_target_volume, in the order W was fitted
     in, so `loading_matrix` can hand the pair to code written against PCA
     components. Reported in the units build_latents reports, not the fit's.
+
+    A projection reports the reference fit's loadings unchanged: it describes
+    the same axes over the same targets, which is the whole point of it.
     """
-    return _build(lcfg, spec, seed_split, cache_root, log, LOADINGS)
+    return _build(lcfg, spec, seed_split, cache_root, log, LOADINGS, ref_seed_split)
 
 
-def _build(lcfg, spec, seed_split, cache_root, log, want):
+def build_params(lcfg, spec, seed_split, cache_root=None, log=print,
+                 ref_seed_split=None):
+    """The fit's global parameters, as everything the loadings do not carry.
+
+    The ordinal threshold, and the centre and scale the exported coordinates
+    were standardised by -- which is what recovers W and b from the loadings,
+    since those are reported in the standardised units.
+    """
+    return _build(lcfg, spec, seed_split, cache_root, log, PARAMS, ref_seed_split)
+
+
+def _build(lcfg, spec, seed_split, cache_root, log, want, ref_seed_split=None):
     """Whichever output was asked for, refitting only when that one is absent.
 
     Latents cached before the loadings existed are still valid on their own, so
-    asking for them never refits for the sake of the sibling file.
+    asking for them never refits for the sake of the sibling file -- and a refit
+    for a sibling's sake leaves the files already on disk alone, so a fit that
+    predates an output gains it without its trajectories moving underneath the
+    landscape models trained on them.
     """
     paths = _cache_paths(lcfg, spec, cache_root)
     if paths[want] and os.path.exists(paths[want]):
         log(f'reusing cached {paths[want]}')
-        return pl.read_parquet(paths[want])
+        return _read(paths[want], want)
 
-    built = _fit(lcfg, spec, seed_split, log)
+    if reference(lcfg) is None:
+        built = _fit(lcfg, spec, seed_split, log)
+    elif ref_seed_split is None:
+        raise ValueError('a projected configuration needs ref_seed_split: the '
+                         'split over the reference aggregate\'s own seeds')
+    else:
+        built = _project(lcfg, spec, seed_split, ref_seed_split, cache_root, log)
     if cache_root:
         os.makedirs(os.path.dirname(paths[0]), exist_ok=True)
-        for path, frame in zip(paths, built):
-            frame.write_parquet(path, compression='zstd')
+        for i, (path, obj) in enumerate(zip(paths, built)):
+            if not os.path.exists(path):
+                _write(path, obj, i)
     return built[want]
 
 
@@ -309,9 +375,10 @@ def loading_matrix(loadings):
 
 
 def _fit(lcfg, spec, seed_split, log):
-    """Returns (per-bin states, per-target loadings)."""
+    """Returns (per-bin states, per-target loadings, global parameters)."""
     df, meta = cells.load(lcfg.cells_path, lcfg.bin_factor,
-                          min_target_volume=lcfg.min_target_volume)
+                          min_target_volume=lcfg.min_target_volume,
+                          traj_col=lcfg.traj_col)
     K = lcfg.n_dims
     # both bin indices come from the untruncated grid, then the grid is cut to
     # the window's end so no state is informed by anything after it
@@ -356,10 +423,80 @@ def _fit(lcfg, spec, seed_split, log):
     post_sd = np.sqrt(np.maximum(np.diagonal(Ezz, axis1=2, axis2=3), 0.0)) / sd
 
     out = _to_frame(df, meta, Ez, Ez_c, post_sd, K, lcfg.interp_days)
-    out = out.join(pl.DataFrame({'filter_value': list(seed_split),
-                                 'traj_split': list(seed_split.values())}),
-                   on='filter_value', how='left')
-    return out, _loading_frame(meta, r['W'], r['b'], mu, sd)
+    return (_label(out, seed_split), _loading_frame(meta, r['W'], r['b'], mu, sd),
+            _param_record(r['c'], mu, sd, meta, K))
+
+
+def _label(out, seed_split):
+    return out.join(pl.DataFrame({'filter_value': list(seed_split),
+                                  'traj_split': list(seed_split.values())}),
+                    on='filter_value', how='left')
+
+
+def _param_record(c, mu, sd, meta, K):
+    return {'c': float(c), 'mu': [float(x) for x in mu],
+            'sd': [float(x) for x in sd], 'dt': float(meta['dt']), 'n_dims': int(K)}
+
+
+def _frozen(loadings, params):
+    """W and b in the fit's own units, back out of the exported loadings.
+
+    The loadings carry W * sd with mu folded into the intercept, which is the
+    basis the coordinates are reported in -- but the prior over z is the one the
+    fit imposed, on the unstandardised scale, so inference has to run there.
+    """
+    sd = np.asarray(params['sd'])
+    mu = np.asarray(params['mu'])
+    W = loadings['loading'].to_numpy() / sd
+    return W, loadings['intercept'].to_numpy() - W @ mu, mu, sd
+
+
+def _project(lcfg, spec, seed_split, ref_seed_split, cache_root, log):
+    """Infer z on this aggregate with a reference fit's parameters held fixed.
+
+    Nothing is learned here: W, b and the threshold come from the reference, the
+    target index is pinned to the one they were fitted over, and the exported
+    coordinates are standardised by the reference's centre and scale. So the
+    axes are the reference's axes, and a landscape trained on either is trained
+    on the same space.
+    """
+    ref = reference(lcfg)
+    kw = dict(cache_root=cache_root, log=log)
+    loadings = build_loadings(ref, spec, ref_seed_split, **kw)
+    params = build_params(ref, spec, ref_seed_split, **kw)
+    W, b, mu, sd = _frozen(loadings, params)
+    K = lcfg.n_dims
+
+    df, meta = cells.load(lcfg.cells_path, lcfg.bin_factor,
+                          targets=loadings['target'].to_list(),
+                          traj_col=lcfg.traj_col)
+    df, meta = cells.truncate(df, meta,
+                              cells.window_end_bin(meta, spec.origin_offset_days))
+    if meta['dt'] != params['dt']:
+        raise ValueError(f"grid spacing {meta['dt']} does not match the "
+                         f"reference fit's {params['dt']}: same bin_factor, "
+                         'different aggregates?')
+    log(f"M={meta['M']} J={meta['J']} T={meta['T']} K={K} "
+        f'projecting onto {os.path.basename(ref.cells_path)}')
+
+    comps = fit_mod.prior_components(K, lcfg.n_fast, lcfg.fast_tau,
+                                     lcfg.slow_kind, lcfg.slow_tau,
+                                     fast_kind=lcfg.fast_kind)
+    df, n_arch, logL = observation(
+        df, lcfg.obs_model, lcfg.obs_temperature,
+        lcfg.prob_resolution, lcfg.prob_floor, lcfg.calibration_path)
+    d_all = cells.pack(cells.deflate(df, lcfg.rho), meta, n_arch)
+    def state(filtered):
+        return fit_mod.infer(d_all, comps, meta['dt'], K, W, b, params['c'],
+                             lcfg.infer_iters, filtered=filtered, logL=logL)
+
+    Ez, Ezz = state(False)
+    Ez_c, _ = state(True)
+
+    post_sd = np.sqrt(np.maximum(np.diagonal(Ezz, axis1=2, axis2=3), 0.0)) / sd
+    out = _to_frame(df, meta, (Ez - mu) / sd, (Ez_c - mu) / sd, post_sd, K,
+                    lcfg.interp_days)
+    return _label(out, seed_split), loadings, params
 
 
 def _fine_grid(lo, hi, step):

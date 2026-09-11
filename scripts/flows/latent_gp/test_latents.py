@@ -21,7 +21,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import splits                                  # noqa: E402
 from latent_gp import (LatentConfig, build_latents, build_loadings,   # noqa: E402
-                       coord_cols, loading_matrix)
+                       build_params, coord_cols, loading_matrix)
+from latent_gp import cells as gp_cells                          # noqa: E402
 
 M, J, T, K_TRUE, C_TRUE = 40, 25, 60, 3, 1.2
 BIN_DAYS = 2
@@ -160,6 +161,7 @@ def main():
 
         check_loadings(td, clean, spec, seed_split, lcfg_kw, W, b, z)
         check_rolling_origin(td, seed_split, lcfg_kw)
+        check_projection(td, clean, spec, seed_split, lcfg_kw, a)
 
     print('\nall latent-pipeline checks passed')
 
@@ -182,12 +184,21 @@ def check_loadings(td, clean, spec, seed_split, lcfg_kw, W_true, b_true, z_true)
     # inside rather than beside every other configuration's
     fit, = os.listdir(cache)
     assert sorted(os.listdir(os.path.join(cache, fit))) == \
-        ['latents.parquet.zstd', 'loadings.parquet.zstd'], fit
+        ['latents.parquet.zstd', 'loadings.parquet.zstd', 'params.json'], fit
 
     # one fit serves both, so asking for the sibling must not refit
     seen.clear()
     a = build_latents(lcfg, spec, seed_split, **kw)
     assert any('reusing cached' in m for m in seen), seen
+
+    # a fit predating an output regains it without the frames beside it moving:
+    # those are what the landscape models on top were trained on
+    latents_path = os.path.join(cache, fit, 'latents.parquet.zstd')
+    before = open(latents_path, 'rb').read()
+    os.remove(os.path.join(cache, fit, 'params.json'))
+    params = build_params(lcfg, spec, seed_split, **kw)
+    assert set(params) == {'c', 'mu', 'sd', 'dt', 'n_dims'}, params
+    assert open(latents_path, 'rb').read() == before, 'the refit rewrote the latents'
 
     assert loadings['target'].to_list() == [f'target{j:02d}' for j in range(J)]
     assert loadings['loading'].dtype == pl.Array(pl.Float64, 3), loadings['loading'].dtype
@@ -249,6 +260,78 @@ def check_rolling_origin(td, seed_split, lcfg_kw):
     assert len(a) < len(u), 'the rolled origin kept just as many bins'
     assert rolled < 1e-9, f'data past the window end reached the fold ({rolled:.2e})'
     assert unrolled > 1e-3, f'the flip moves nothing even unrolled ({unrolled:.2e})'
+
+
+PLATFORMS = ('twitter', 'tiktok')
+
+
+def handles(clean, path):
+    """The same cells keyed by platform handle instead of by seed.
+
+    Each seed's cells are partitioned between two handles rather than copied, so
+    a handle is a real subset of that seed's posts and the two together are
+    exactly the seed -- which is what makes the projected coordinates comparable
+    against the pooled ones.
+    """
+    df = pl.read_parquet(clean).with_columns(
+        pl.col('target').str.slice(-1).cast(pl.Int64).alias('_j'))
+    plat = pl.when(pl.col('_j') % 2 == 0).then(pl.lit(PLATFORMS[0])) \
+             .otherwise(pl.lit(PLATFORMS[1]))
+    df.with_columns(
+        (pl.col('SeedName') + '-' + plat + '-handle').alias('PlatformHandleID')
+    ).drop('_j').write_parquet(path, compression='zstd')
+    return path
+
+
+def check_projection(td, clean, spec, seed_split, lcfg_kw, pooled):
+    """A projected fit must report the pooled fit's axes, not its own.
+
+    The loadings and the standardisation are the axes, so they have to come back
+    identical; what is actually inferred is z, and a handle's z has to track the
+    seed it is part of. Rotate the basis and the second check fails while the
+    first still passes, which is why both are here.
+    """
+    cache = os.path.join(td, 'projection_cache')
+    path = handles(clean, os.path.join(td, 'handles.parquet.zstd'))
+    kw = dict(cache_root=cache, log=lambda *a: None)
+
+    ref = LatentConfig(cells_path=clean, **lcfg_kw)
+    lcfg = LatentConfig(cells_path=path, ref_cells_path=clean,
+                        traj_col=gp_cells.HANDLE_COL, **lcfg_kw)
+
+    # a handle inherits its seed's cell: the reference fit already saw that
+    # seed's posts, so hashing the handle would hold out a trajectory whose own
+    # data shaped the axes it is scored in
+    key = gp_cells.traj_seeds(path, gp_cells.HANDLE_COL)
+    handle_split = splits.seed_split(gp_cells.seed_names(path, gp_cells.HANDLE_COL),
+                                     spec, key=key)
+    assert len(handle_split) == len(PLATFORMS) * M, len(handle_split)
+    assert all(handle_split[h] == seed_split[s] for h, s in key.items())
+
+    got = build_latents(lcfg, spec, handle_split, ref_seed_split=seed_split, **kw)
+    assert build_loadings(lcfg, spec, handle_split, ref_seed_split=seed_split,
+                          **kw).equals(build_loadings(ref, spec, seed_split, **kw))
+    assert build_params(lcfg, spec, handle_split, ref_seed_split=seed_split,
+                        **kw) == build_params(ref, spec, seed_split, **kw)
+
+    # the reference fit sits in its own directory, not the projection's
+    assert len(os.listdir(cache)) == 2, os.listdir(cache)
+
+    c_coord = coord_cols(3)[0]
+    key_cols = ['filter_value', 'createtime']
+    per_seed = got.with_columns(
+        pl.col('filter_value').str.split('-').list.get(0).alias('seed')) \
+        .group_by(['seed', 'createtime']) \
+        .agg([pl.col(c_coord).arr.get(k).mean().alias(f'd{k}') for k in range(3)]) \
+        .join(pooled.select(key_cols + [c_coord]), left_on=['seed', 'createtime'],
+              right_on=key_cols, how='inner')
+    assert len(per_seed) == len(pooled), (len(per_seed), len(pooled))
+
+    ref_coords = np.stack(per_seed[c_coord].to_numpy())
+    for k in range(3):
+        r = float(np.corrcoef(per_seed[f'd{k}'].to_numpy(), ref_coords[:, k])[0, 1])
+        print(f'projected dim {k} vs pooled: r = {r:.3f}')
+        assert r > 0.9, f'dimension {k} is not the pooled one ({r:.3f})'
 
 
 if __name__ == '__main__':

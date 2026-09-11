@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import matplotlib.ticker as ticker
 from matplotlib.patches import Patch
 import numpy as np
+import omegaconf
 import polars as pl
 from tqdm import tqdm
 
@@ -686,7 +687,6 @@ def main(cfg):
     PLOT_POTENTIAL_LANDSCAPES = False
     PLOT_SINGLE = True
 
-    dims_str = '_'.join(str(d) for d in range(cfg.n_dims))
     state_path = sweep_runs.state_path(run_dir(cfg))
     model, _ = DeepTimePhiPLNN.load(state_path, dtype=dtype)
 
@@ -800,24 +800,23 @@ def main(cfg):
 
         fig, axes = plt.subplots(1, 4, figsize=(16, 4.5))
 
-        # Load all platform models upfront — mirror the directory layout used by nn_potential.py.
-        # Build per-platform marginal_samples from the corresponding filter_value subset so
-        # the marginalization over non-displayed dims reflects that platform's distribution.
+        # One model per platform, each trained by nn_potential.py under a cfg
+        # differing only in `platform`, so run_dir locates it without a second
+        # opinion about where a run is written. cfg is that run's own
+        # configuration at platform='all': a handle-keyed representation
+        # projected onto the pooled fit, which is the space every panel shares.
+        # Per-platform marginal_samples come from the matching subset, so
+        # marginalising over the non-displayed dimensions reflects that
+        # platform's own distribution.
         platform_models = {}
         platform_dfs = {}
         platform_marginal_samples = {}
-        trend_name = 'platform_handle_noun_phrase_bkrr_trends'
         for platform in PLATFORMS:
-            platform_dir = f'dims_{dims_str}_{platform}_rm292'
-            platform_state_path = sweep_runs.state_path(
-                os.path.join('./out/', trend_name, platform_dir))
+            platform_cfg = omegaconf.OmegaConf.merge(cfg, {'platform': platform})
+            platform_state_path = sweep_runs.state_path(run_dir(platform_cfg))
             platform_models[platform], _ = DeepTimePhiPLNN.load(platform_state_path, dtype=dtype)
 
-            platform_dfs[platform] = target_df.filter(
-                pl.col('filter_value').cast(pl.String) \
-                    .str.to_lowercase() \
-                    .str.contains(f'-{platform}-')
-            )
+            platform_dfs[platform] = latent_space.keep_platform(platform_cfg, target_df)
             plat_coords = platform_dfs[platform][f'coord_{cfg.n_dims}d'].to_numpy()
             platform_marginal_samples[platform] = plat_coords[:, :cfg.n_dims] if cfg.n_dims > 2 else None
 

@@ -1,9 +1,15 @@
 """Cell-level stance aggregate: loading, holdout masks and packing.
 
-A cell is one (seed, target, time bin). The three ordinal category counts are
-determined exactly by (n, s_sum, s2_sum) -- under hard labels as integers, and
-under the classifier's probabilities as expected counts, since the same three
-moments carry either. So switching between them never rebuilds the aggregate.
+A cell is one (trajectory, target, time bin). The three ordinal category counts
+are determined exactly by (n, s_sum, s2_sum) -- under hard labels as integers,
+and under the classifier's probabilities as expected counts, since the same
+three moments carry either. So switching between them never rebuilds the
+aggregate.
+
+A trajectory is a seed by default. An aggregate keyed by `PlatformHandleID`
+splits each seed into one trajectory per platform instead, which is what the
+platform-specific landscapes are fitted over; `traj_col` picks between them and
+the rest of the pipeline is unchanged.
 
 Expected counts at a temperature need the probabilities themselves, and take
 them from the `q<i>` columns: the count of posts falling on lattice point i of
@@ -23,6 +29,10 @@ from . import _jax  # noqa: F401  -- x64 before the first array
 from . import probs as probs_mod
 
 ARCH_RE = re.compile(r'^q(\d+)$')
+
+# Trajectory key of an aggregate: one row per seed, or one per platform handle.
+SEED_COL = 'SeedName'
+HANDLE_COL = 'PlatformHandleID'
 
 
 def arch_cols(columns):
@@ -65,19 +75,27 @@ def lattice(df, resolution):
     return acc.T
 
 
-def load(path, bin_factor, seeds=None, min_target_volume=None):
+def load(path, bin_factor, seeds=None, min_target_volume=None, targets=None,
+         traj_col=SEED_COL):
     """Re-bin the 2-day aggregate onto the latent grid and index seeds/targets.
 
     `seeds` restricts the seed set before indices are assigned, so a subset run
     still produces contiguous indices.
+
+    `targets` pins the target index instead of reading it off the data, which is
+    what lets a second aggregate be scored against loadings fitted on the first:
+    column j has to mean the same target in both. Targets it names that this
+    aggregate never mentions keep their column and simply carry no cells.
 
     Streamed: read eagerly, the full aggregate costs five times the memory of
     the frame it returns, and two fits sharing a machine will not fit.
     """
     lf = pl.scan_parquet(path)
     if seeds is not None:
-        lf = lf.filter(pl.col('SeedName').is_in(list(seeds)))
-    if min_target_volume:
+        lf = lf.filter(pl.col(traj_col).is_in(list(seeds)))
+    if targets is not None:
+        lf = lf.filter(pl.col('target').is_in(list(targets)))
+    elif min_target_volume:
         keep = (lf.group_by('target').agg(pl.col('n').sum().alias('v'))
                   .filter(pl.col('v') >= min_target_volume).select('target'))
         lf = lf.join(keep, on='target', how='inner')
@@ -85,13 +103,14 @@ def load(path, bin_factor, seeds=None, min_target_volume=None):
     def one(expr):
         return lf.select(expr).collect(engine='streaming')
 
-    seed_names = one(pl.col('SeedName').unique().sort())['SeedName'].to_list()
-    targets = one(pl.col('target').unique().sort())['target'].to_list()
+    seed_names = one(pl.col(traj_col).unique().sort())[traj_col].to_list()
+    targets = (list(targets) if targets is not None
+               else one(pl.col('target').unique().sort())['target'].to_list())
     t0 = one(pl.col('bin').min())['bin'][0]
 
     arch = arch_cols(lf.collect_schema().names())
     lf = lf.with_columns([
-        pl.col('SeedName').replace_strict({s: i for i, s in enumerate(seed_names)}).alias('m'),
+        pl.col(traj_col).replace_strict({s: i for i, s in enumerate(seed_names)}).alias('m'),
         pl.col('target').replace_strict({s: i for i, s in enumerate(targets)}).alias('j'),
         ((pl.col('bin') - pl.lit(t0)).dt.total_days() // (2 * bin_factor))
             .cast(pl.Int64).alias('t'),
@@ -239,7 +258,22 @@ def eval_set(df):
     )
 
 
-def seed_names(path):
+def seed_names(path, traj_col=SEED_COL):
     """Trajectory ids present in a cell file, without loading the counts."""
-    return (pl.scan_parquet(path).select('SeedName').unique()
-              .collect()['SeedName'].sort().to_list())
+    return (pl.scan_parquet(path).select(traj_col).unique()
+              .collect()[traj_col].sort().to_list())
+
+
+def traj_seeds(path, traj_col):
+    """Trajectory id -> the seed it belongs to.
+
+    A handle-keyed aggregate has to inherit its seed's train/val/test cell: the
+    representation was fitted over whole seeds, so splitting one seed's handles
+    across the boundary would hold a trajectory out of the landscape whose own
+    posts had already shaped the axes it is scored in.
+    """
+    if traj_col == SEED_COL:
+        return None
+    got = (pl.scan_parquet(path).select([traj_col, SEED_COL]).unique()
+             .collect(engine='streaming'))
+    return dict(zip(got[traj_col].to_list(), got[SEED_COL].to_list()))

@@ -1,6 +1,9 @@
 """Build the cell-level stance aggregate from the weekly classifier output.
 
-A cell is one (seed, target, 2-day bin). Each cell carries
+A cell is one (trajectory, target, 2-day bin), where a trajectory is a seed by
+default and one of its platform accounts under `--traj-col PlatformHandleID`.
+The handle-keyed build keeps the seed alongside, which is what lets a handle
+inherit its seed's train/val/test cell. Each cell carries
 
   n, s_sum, s2_sum     the hard-label moments, which fix the three ordinal
                        category counts exactly
@@ -19,6 +22,9 @@ and importing the package used to take 2GB from a card that was classifying.
 
     PYTHONPATH=scripts/flows JAX_PLATFORMS=cpu POLARS_MAX_THREADS=12 \
         python -m latent_gp.aggregate
+
+and again with `--traj-col PlatformHandleID --parts-dir ... --out ...` for the
+aggregate the platform-specific landscapes are projected onto.
 """
 
 import glob
@@ -34,6 +40,8 @@ from . import probs
 WEEK_RE = re.compile(r'(\d{4})_(\d{1,2})_doc_targets')
 STANCE_COLUMNS = ['id', 'platform', 'createtime', 'Targets', 'Stances', 'seed']
 BIN = '2d'
+
+SEED_COL = 'SeedName'
 
 # the actor types the trajectory model is about; media and state accounts are
 # excluded among foreign seeds because they are not individuals holding stances
@@ -114,9 +122,8 @@ def _pairs(stance_path, probs_path):
     """One row per (post, target) with a seed, a hard stance and a probability vector."""
     df = pl.read_parquet(stance_path, columns=STANCE_COLUMNS)
     df = df.unique(['id', 'platform']).with_columns([
-        pl.col('seed').struct.field('SeedName').alias('SeedName'),
-        pl.col('seed').struct.field('MainType').alias('MainType'),
-        pl.col('seed').struct.field('SubType').alias('SubType'),
+        pl.col('seed').struct.field(f).alias(f)
+        for f in (SEED_COL, 'PlatformHandleID', 'MainType', 'SubType')
     ]).drop('seed')
     df = df.filter(
         pl.col('MainType').is_in(KEEP_TYPES)
@@ -135,7 +142,7 @@ def _pairs(stance_path, probs_path):
     return df if len(df) else None
 
 
-def _aggregate_week(df, resolution):
+def _aggregate_week(df, resolution, keys=(SEED_COL,)):
     """Per-cell hard moments and lattice counts for one week's pairs."""
     df = df.with_columns([
         pl.col('Stances').replace_strict(probs.STANCE_VALUE, default=None).alias('s'),
@@ -148,14 +155,24 @@ def _aggregate_week(df, resolution):
     idx = probs.assign(df['p'].to_numpy(), resolution)
     df = df.with_columns(pl.Series('arch', idx))
     L = probs.n_archetypes(resolution)
-    return df.rename({'Targets': 'target'}).group_by(['SeedName', 'target', 'bin']).agg(
+    return df.rename({'Targets': 'target'}).group_by([*keys, 'target', 'bin']).agg(
         [pl.col('s').sum().alias('s_sum'),
          (pl.col('s') ** 2).sum().alias('s2_sum'),
          pl.len().alias('n')]
         + [(pl.col('arch') == i).sum().cast(pl.Float64).alias(f'q{i}') for i in range(L)])
 
 
-def build_parts(stance_dir, probs_dir, parts_dir, resolution, log=print):
+def traj_keys(traj_col):
+    """Grouping columns for a trajectory key.
+
+    A handle-keyed cell keeps its seed: the handle is what the fit indexes, the
+    seed is what decides which side of the split it falls on.
+    """
+    return (SEED_COL,) if traj_col == SEED_COL else (traj_col, SEED_COL)
+
+
+def build_parts(stance_dir, probs_dir, parts_dir, resolution, keys=(SEED_COL,),
+                log=print):
     """Aggregate every week whose part does not match its sources.
 
     A part with no recorded digest is rebuilt: without provenance there is no
@@ -179,7 +196,7 @@ def build_parts(stance_dir, probs_dir, parts_dir, resolution, log=print):
 
     for i, ((year, week), s_path, p_path, out, want) in enumerate(todo):
         pairs = _pairs(s_path, p_path)
-        agg = None if pairs is None else _aggregate_week(pairs, resolution)
+        agg = None if pairs is None else _aggregate_week(pairs, resolution, keys)
         if agg is None:
             log(f'  {year}_{week}: no usable pairs')
             continue
@@ -190,7 +207,7 @@ def build_parts(stance_dir, probs_dir, parts_dir, resolution, log=print):
     return len(ready), len(todo)
 
 
-def merge_parts(parts_dir, cache, log=print):
+def merge_parts(parts_dir, cache, keys=(SEED_COL,), log=print):
     """Sum the part files into one aggregate.
 
     A 2-day bin can straddle two weekly files, so the parts have to be summed
@@ -201,23 +218,25 @@ def merge_parts(parts_dir, cache, log=print):
     if not parts:
         raise ValueError(f'no part files in {parts_dir}')
     lf = pl.scan_parquet(parts)
-    value_cols = [c for c in lf.collect_schema().names()
-                  if c not in ('SeedName', 'target', 'bin')]
+    group = [*keys, 'target', 'bin']
+    value_cols = [c for c in lf.collect_schema().names() if c not in group]
     os.makedirs(os.path.dirname(cache) or '.', exist_ok=True)
-    (lf.group_by(['SeedName', 'target', 'bin'])
+    (lf.group_by(group)
        .agg([pl.col(c).sum() for c in value_cols])
        .sink_parquet(cache, compression='zstd'))
     log(f'wrote {cache} from {len(parts)} parts')
 
 
-def build(stance_dir, probs_dir, parts_dir, cache, resolution=6, log=print):
+def build(stance_dir, probs_dir, parts_dir, cache, resolution=6,
+          traj_col=SEED_COL, log=print):
     """Bring the parts and the merged aggregate up to date with their sources."""
-    build_parts(stance_dir, probs_dir, parts_dir, resolution, log=log)
+    keys = traj_keys(traj_col)
+    build_parts(stance_dir, probs_dir, parts_dir, resolution, keys, log=log)
     want = parts_digest(parts_dir)
     if os.path.exists(cache) and read_sidecar(cache + SIDECAR) == want:
         log(f'aggregate {cache} matches its parts')
         return
-    merge_parts(parts_dir, cache, log=log)
+    merge_parts(parts_dir, cache, keys, log=log)
     write_sidecar(cache + SIDECAR, want)
 
 
@@ -229,15 +248,19 @@ def main():
     ap.add_argument('--parts-dir', default='tmp/gpfa_cell_parts')
     ap.add_argument('--out', default='tmp/gpfa_cells_2022_onwards.parquet.zstd')
     ap.add_argument('--resolution', type=int, default=6)
+    ap.add_argument('--traj-col', default=SEED_COL,
+                    choices=[SEED_COL, 'PlatformHandleID'],
+                    help='what one trajectory is; parts are keyed by it, so a '
+                         'change needs its own --parts-dir and --out')
     args = ap.parse_args()
     probs_dir = args.probs_dir or f'{args.stance_dir}_probs'
 
     build(args.stance_dir, probs_dir, args.parts_dir, args.out, args.resolution,
-          log=lambda *a: print(*a, flush=True))
+          args.traj_col, log=lambda *a: print(*a, flush=True))
 
     lf = pl.scan_parquet(args.out)
     print(lf.select(pl.len().alias('cells'), pl.col('n').sum().alias('posts'),
-                    pl.col('SeedName').n_unique().alias('seeds'),
+                    pl.col(args.traj_col).n_unique().alias('trajectories'),
                     pl.col('target').n_unique().alias('targets'),
                     pl.col('bin').min().alias('lo'),
                     pl.col('bin').max().alias('hi')).collect(), flush=True)

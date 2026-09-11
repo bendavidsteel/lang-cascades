@@ -3,6 +3,9 @@
 Exercises load_latent_df -> build_training_pairs -> label_pairs and asserts the
 scenario cells are populated and leak-free, without needing plnn or a GPU.
 
+`check_platform_run` does the same for a platform-specific landscape, whose
+trajectories are accounts projected onto the pooled fit's axes.
+
 Run as: python test_nested_split_pipeline.py
 """
 
@@ -35,7 +38,8 @@ sys.modules['hydra'].main = lambda **kw: (lambda f: f)
 import splits                                    # noqa: E402
 import latent_space                              # noqa: E402
 import nn_potential as nnp                       # noqa: E402
-from latent_gp.test_latents import synth, M      # noqa: E402
+from latent_gp import cells as gp_cells          # noqa: E402
+from latent_gp.test_latents import PLATFORMS, handles, synth, M   # noqa: E402
 
 
 def make_cfg(cells_path, out_dir):
@@ -164,6 +168,71 @@ def check_per_dimension_gain():
           f"unweighted {met['direction_rho_per_dim']:.4f}")
 
 
+def check_platform_run(td, cells, out_dir):
+    """One landscape per platform, all of them in the pooled fit's space.
+
+    The representation is shared -- every platform reads the same projected fit
+    -- so what separates the runs is `platform` alone, and what must not
+    separate them is the axes.
+    """
+    handle_cells = handles(cells, os.path.join(td, 'handles.parquet.zstd'))
+    cfg = make_cfg(handle_cells, out_dir)
+    cfg.latents.ref_cells_path = cells
+    cfg.latents.traj_col = gp_cells.HANDLE_COL
+    spec = splits.SplitSpec.from_cfg(cfg)
+
+    _, pooled_components, pooled_targets = latent_space.load(make_cfg(cells, out_dir))
+    _, components, targets = latent_space.load(cfg)
+    assert targets == pooled_targets
+    assert np.array_equal(components, pooled_components), \
+        'the projection reported axes of its own'
+
+    key = latent_space.split_key(cfg)
+    seed_splits = splits.seed_split(gp_cells.seed_names(cells), spec)
+    assert len(key) == len(PLATFORMS) * M
+
+    dirs = set()
+    for platform in PLATFORMS:
+        cfg.platform = platform
+        df = nnp.load_latent_df(cfg, spec)
+        assert df.columns == ['createtime', 'filter_value', 'x0']
+        assert df['filter_value'].n_unique() == M, platform
+        assert df['filter_value'].str.contains(f'-{platform}-').all()
+
+        pairs = nnp.build_training_pairs(cfg, df, smooth=False)
+        labelled = splits.label_pairs(pairs, spec, time_col='next_createtime', key=key)
+        train = splits.training_rows(labelled)
+        for traj in splits.TRAJ_SPLITS:
+            for time in splits.TIME_SPLITS:
+                cell = splits.select(labelled, traj, time)
+                splits.check_leakage(train, cell, splits.scenario_name(traj, time))
+                assert len(cell) > 0, f'{platform} {traj}_{time} is empty'
+
+        # a handle is on the side of the boundary its seed is on, or the axes
+        # were fitted on posts belonging to a trajectory being held out here
+        by_seed = dict(zip(labelled['filter_value'].to_list(),
+                           labelled['traj_split'].to_list()))
+        assert all(by_seed[h] == seed_splits[key[h]] for h in by_seed)
+        dirs.add(nnp.run_dir(cfg))
+
+    assert len(dirs) == len(PLATFORMS), dirs
+    assert len({os.path.dirname(d) for d in dirs}) == 1, \
+        'the platforms did not share one representation'
+    print(f'{len(PLATFORMS)} platform landscapes over one projected fit, '
+          'each in the pooled axes')
+
+    cfg.platform = 'all'
+    seed_cfg = make_cfg(cells, out_dir)
+    seed_cfg.platform = PLATFORMS[0]
+    try:
+        nnp.load_latent_df(seed_cfg, spec)
+    except ValueError as e:
+        assert 'handle-keyed' in str(e), e
+    else:
+        raise AssertionError('a platform of a seed-keyed run should not resolve')
+    print('a platform run on seed-keyed latents is refused, not silently empty')
+
+
 def main():
     with tempfile.TemporaryDirectory() as td:
         cells = os.path.join(td, 'cells.parquet.zstd')
@@ -245,6 +314,8 @@ def main():
         d4 = nnp.run_dir(cfg)
         assert len({d1, d2, d3, d4}) == 4, (d1, d2, d3, d4)
         print('run_dir separates latent, split and landscape configurations')
+
+        check_platform_run(td, cells, os.path.join(td, 'out'))
 
     print('displacement decomposition:')
     check_displacement_identity()
