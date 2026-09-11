@@ -11,7 +11,7 @@ from plnn.models import DeepTimePhiPLNN
 
 from nn_potential import df_to_data, compute_rolling_means, build_horizon_pairs, \
     evaluate_dataloader, compute_training_split, apply_split
-from plot_nn_potential import get_most_recent_state
+from sweep_runs import state_path as select_state
 
 HORIZON_DAYS = [7, 14, 30, 60, 90]
 
@@ -81,8 +81,7 @@ def main(cfg):
 
     # Load trained model
     dtype = jnp.float32
-    states_path = os.path.join(dir_path, 'states')
-    state_path = get_most_recent_state(states_path)
+    state_path = select_state(dir_path)
     print(f"Loading model from: {state_path}", flush=True)
     model, _ = DeepTimePhiPLNN.load(state_path, dtype=dtype)
 

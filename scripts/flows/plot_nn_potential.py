@@ -18,6 +18,7 @@ from plnn.models import DeepTimePhiPLNN
 from plnn.pl.plot_plnn import compute_grad_phi
 
 import latent_space
+import sweep_runs
 from nn_potential import INITIAL_DATE, UNIT_DAYS, run_dir
 from pca_density import create_kde_background, get_top_component_features, format_pca_axis_label
 
@@ -640,11 +641,6 @@ def plot_density_streamplot(
 
     return ax, contours
 
-def get_most_recent_state(path):
-    state_paths = [os.path.join(path, f) for f in os.listdir(path)]
-    most_recent_path = sorted(state_paths, key=lambda p: os.path.getmtime(p))[-1]
-    return most_recent_path
-
 @hydra.main(version_base=None, config_path="../../config", config_name="config")
 def main(cfg):
     # Whatever cfg.latents.method says the model was trained on. The helpers
@@ -691,8 +687,7 @@ def main(cfg):
     PLOT_SINGLE = True
 
     dims_str = '_'.join(str(d) for d in range(cfg.n_dims))
-    states_path = os.path.join(run_dir(cfg), 'states')
-    state_path = get_most_recent_state(states_path)
+    state_path = sweep_runs.state_path(run_dir(cfg))
     model, _ = DeepTimePhiPLNN.load(state_path, dtype=dtype)
 
     # Full-dimensional coords for marginalizing over non-displayed dims
@@ -814,8 +809,8 @@ def main(cfg):
         trend_name = 'platform_handle_noun_phrase_bkrr_trends'
         for platform in PLATFORMS:
             platform_dir = f'dims_{dims_str}_{platform}_rm292'
-            platform_states_path = os.path.join('./out/', trend_name, platform_dir, 'states')
-            platform_state_path = get_most_recent_state(platform_states_path)
+            platform_state_path = sweep_runs.state_path(
+                os.path.join('./out/', trend_name, platform_dir))
             platform_models[platform], _ = DeepTimePhiPLNN.load(platform_state_path, dtype=dtype)
 
             platform_dfs[platform] = target_df.filter(

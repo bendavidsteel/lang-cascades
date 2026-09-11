@@ -27,7 +27,7 @@ from nn_potential import \
     evaluate_dataloader, \
     load_seed_metadata, \
     load_target_df
-from plot_nn_potential import get_most_recent_state
+from sweep_runs import state_path as select_state
 
 import latent_space
 import splits
@@ -143,8 +143,9 @@ def compute_breakdown_metrics(cfg):
 
     val_filter_values, cutoff_time = compute_training_split(cfg)
     spec = splits.SplitSpec.from_cfg(cfg)
+    split_key = latent_space.split_key(cfg)
 
-    state_path = get_most_recent_state(os.path.join(model_dir_for_cfg(cfg), 'states'))
+    state_path = select_state(model_dir_for_cfg(cfg))
     print(f"Loading model state from {state_path}...", flush=True)
     model, _ = DeepTimePhiPLNN.load(state_path, dtype=jnp.float32)
 
@@ -165,7 +166,7 @@ def compute_breakdown_metrics(cfg):
         _, val_paired = apply_split(
             paired_df, cfg.split_type, cfg.train_fraction,
             val_filter_values=val_filter_values, cutoff_time=cutoff_time,
-            spec=spec, scenario=cfg.objective_scenario,
+            spec=spec, scenario=cfg.objective_scenario, key=split_key,
         )
         val_paired = val_paired.with_columns(pl.col('filter_value').cast(pl.String)) \
             .join(seed_df, left_on='filter_value', right_on='SeedName', how='left')
