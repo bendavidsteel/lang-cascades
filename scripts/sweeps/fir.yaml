@@ -66,6 +66,12 @@ parameters:
     value: "[90]"
   breakdown_scenario:
     value: "null"
+  # The landscape is fitted to displacements of whichever state this selects, so
+  # a smoothed one puts the smoother's lookahead into the drift field and not
+  # only into the score. Not an axis: only the filtered state can carry a
+  # forecast claim, and trials across the two are not comparable.
+  latents.causal_state:
+    value: true
 
 
   # --- stance observation model ---
