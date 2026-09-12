@@ -77,6 +77,7 @@ import polars as pl
 from scipy import optimize, stats
 
 import splits
+from latent_gp import drop_prior_dominated
 
 # Latent units: `latent_gp.latents._standardise` scales each dimension by its
 # training-region sd, so every displacement below is in sd, not in PCs.
@@ -687,26 +688,6 @@ def run_variogram(cfg, log=print):
     return v
 
 
-def drop_prior_dominated(df, sd_col, dims, max_sd, log=print):
-    """Drop seeds whose state is mostly prior rather than measurement.
-
-    Filtering whole seeds, not rows: dropping rows would punch holes in series
-    the unit root tests need contiguous. The latent is standardised to unit sd,
-    so a posterior sd near 1 means the data said nothing about that seed. This
-    is the volume filter too: sd is high exactly where `n_posts` is low, and
-    unlike a count it is on the same scale as the state being tested.
-    """
-    med = df.with_columns(
-        pl.col(sd_col).arr.to_list().list.gather(list(dims)).list.mean().alias('_sd')
-    ).group_by('filter_value').agg(pl.col('_sd').median().alias('_sd'))
-    keep = med.filter(pl.col('_sd') <= max_sd)['filter_value'].to_list()
-    log(f"  posterior sd filter (<= {max_sd:g}): keeping {len(keep)} of "
-        f"{med.height} seeds")
-    if len(keep) < 2:
-        raise ValueError(f'posterior sd filter at {max_sd} leaves no panel')
-    return df.filter(pl.col('filter_value').is_in(keep))
-
-
 # --------------------------------------------------------------------------
 # reporting
 # --------------------------------------------------------------------------
@@ -974,7 +955,8 @@ def main(cfg):
 
     spec = splits.SplitSpec.from_cfg(cfg)
     n_fast = cfg.latents.n_fast
-    fast, slow = list(range(n_fast)), list(range(n_fast, cfg.n_dims))
+    fast, slow = (list(range(min(n_fast, cfg.n_dims))),
+                  list(range(min(n_fast, cfg.n_dims), cfg.n_dims)))
     print(f"Fast block dims {fast} (kind={cfg.latents.get('fast_kind', 'wiener')}, "
           f"tau={cfg.latents.fast_tau}); slow block dims {slow} "
           f"(kind={cfg.latents.slow_kind}) -- control, not evidence.")

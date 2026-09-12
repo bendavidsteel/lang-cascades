@@ -71,6 +71,28 @@ def Q_stationary(F, P0):
     return P0 - F @ P0 @ F.T
 
 
+def position_decay(comps, dt, K):
+    """Per-dimension correlation of the position slot across one bin.
+
+    Interpolating between bin centres is a prior bridge, and the bridge is
+    linear only where the position does not revert. Returns None when a
+    dimension carries anything but a single one-state component, which is the
+    case the closed form in latents._interpolate covers.
+    """
+    per_dim = comps if (comps and isinstance(comps[0], (list, tuple))) else [comps] * K
+    if len(per_dim) != K:
+        raise ValueError(f'got {len(per_dim)} component lists for K={K}')
+    out = []
+    for cs in per_dim:
+        if len(cs) != 1:
+            return None
+        F, _, _ = component(dt=dt, **cs[0])
+        if F.shape[0] != 1:
+            return None
+        out.append(float(F[0, 0]))
+    return np.asarray(out)
+
+
 def build_ssm(dt, comps, K):
     """Returns F, Q, P0, S.
 

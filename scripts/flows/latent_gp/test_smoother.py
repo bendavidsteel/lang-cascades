@@ -160,6 +160,11 @@ def main():
         cfgs.append((f'wiener tau={tau:.0f}', [dict(kind='wiener', tau=tau)]))
     cfgs += [('iwp2 tau=1280', [dict(kind='iwp2', tau=1280.)]),
              ('iwp2 tau=5120', [dict(kind='iwp2', tau=5120.)])]
+    # the taus the joint sweep actually offers, which are an order of magnitude
+    # below anything else here: at tau=10 on this grid the prior correlates
+    # adjacent bins at 0.45, so the filter is doing most of the work
+    for tau in (10., 20., 40., 80., 640.):
+        cfgs.append((f'ou tau={tau:.0f}', [dict(kind='ou', tau=tau)]))
     # per-dimension dynamics: dims must keep their own timescale, so a bug here
     # would show up as the dense reference and the filter disagreeing
     fast = dict(kind='wiener', tau=80.)

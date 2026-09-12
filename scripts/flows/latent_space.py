@@ -24,6 +24,7 @@ import polars as pl
 
 import splits
 from latent_gp import (LatentConfig, build_latents, build_loadings, coord_cols,
+                       drop_prior_dominated,
                        fit_dir, loading_matrix, reference)
 from latent_gp import cells as gp_cells
 
@@ -272,9 +273,15 @@ def fit_args(cfg, lcfg=None, spec=None):
 def _gpfa(cfg, spec=None):
     lcfg, spec, kw = fit_args(cfg, spec=spec)
 
-    coord, causal, _ = coord_cols(lcfg.n_dims)
+    coord, causal, sd = coord_cols(lcfg.n_dims)
     state = causal if cfg.latents.causal_state else coord
-    target_df = build_latents(lcfg, spec, **kw) \
+    # the fast block is where the motion is, so a seed whose fast dims are
+    # prior rather than measurement contributes the prior's dynamics and not
+    # the data's -- the same filter the stationarity tests apply
+    fast = list(range(min(lcfg.n_fast, lcfg.n_dims)))
+    target_df = drop_prior_dominated(
+        build_latents(lcfg, spec, **kw), sd, fast,
+        cfg.get('max_posterior_sd', 0.8), log=logger.info) \
         .select(['createtime', 'filter_value', pl.col(state).alias(COORD)]) \
         .sort(['filter_value', 'createtime'])
 

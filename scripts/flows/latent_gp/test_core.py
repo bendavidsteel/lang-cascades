@@ -226,3 +226,73 @@ def test_default_w_ridge_keeps_the_cache_tag_of_fits_that_predate_it():
                 fast_kind='ou', slow_kind='const', bin_factor=8)
     assert LatentConfig(**base).tag == LatentConfig(**base, w_ridge=W_RIDGE_OFF).tag
     assert LatentConfig(**base).tag != LatentConfig(**base, w_ridge=50.0).tag
+
+
+def test_the_bridge_matches_the_exact_ou_posterior_between_knots():
+    """Linear weights are the F -> 1 limit, so the gap is the whole correction:
+    the OU bridge sags toward the prior mean and linear interpolation does not.
+    """
+    from latent_gp.latents import _bridge_weights
+    dt, tau = 32.0, 10.0
+    F = float(gpfa.component('ou', dt=dt, tau=tau)[0][0, 0])
+    w = np.linspace(0.0, 1.0, 9)[:, None]
+    lo, hi = _bridge_weights(w, np.array([F]))
+
+    # exact conditional mean under the exponential kernel, knots at 1 and 1
+    rho = lambda s: F ** s
+    exact = [(rho(x) - rho(2 - x)) / (1 - F ** 2) + (rho(1 - x) - rho(1 + x)) / (1 - F ** 2)
+             for x in w[:, 0]]
+    assert np.allclose(lo[:, 0] + hi[:, 0], exact, atol=1e-12)
+    assert np.isclose(lo[0, 0], 1.0) and np.isclose(hi[0, 0], 0.0)
+    assert np.isclose(lo[-1, 0], 0.0) and np.isclose(hi[-1, 0], 1.0)
+    mid = lo[4, 0] + hi[4, 0]
+    assert mid < 0.8, mid                      # linear would be exactly 1.0
+
+
+def test_a_non_reverting_prior_still_interpolates_linearly():
+    from latent_gp.latents import _bridge_weights
+    w = np.linspace(0.0, 1.0, 5)[:, None]
+    for kind, kw in (('const', {}), ('wiener', dict(tau=640.0))):
+        F = float(gpfa.component(kind, dt=16.0, **kw)[0][0, 0])
+        lo, hi = _bridge_weights(w, np.array([F]))
+        assert np.allclose(lo[:, 0], 1 - w[:, 0]), kind
+        assert np.allclose(hi[:, 0], w[:, 0]), kind
+
+
+def test_the_causal_column_never_reads_the_bin_ahead():
+    """Every interpolated causal row must be a function of the knot behind it
+    alone; a bridge would carry the next knot's observations backward in time.
+    """
+    from latent_gp.latents import _extrapolate
+    Ez_c = np.array([[[1.0], [5.0], [9.0]]])          # one seed, three bins
+    m_i = np.zeros(5, dtype=int)
+    u = np.array([0.0, 0.25, 0.5, 0.75, 1.0])
+    held = _extrapolate(Ez_c, m_i, u, decay=None)[:, 0]
+    assert np.allclose(held[:4], 1.0) and np.isclose(held[4], 5.0)
+
+    F = float(gpfa.component('ou', dt=32.0, tau=10.0)[0][0, 0])
+    decayed = _extrapolate(Ez_c, m_i, u, decay=np.array([F]))[:, 0]
+    assert np.allclose(decayed[:4], F ** u[:4])
+    assert np.all(np.diff(decayed[:4]) < 0)           # toward the prior mean
+
+
+def test_position_decay_declines_a_prior_the_closed_form_cannot_express():
+    one = [dict(kind='ou', tau=20.0)]
+    assert gpfa.position_decay(one, 16.0, 3).shape == (3,)
+    assert gpfa.position_decay([dict(kind='matern32', tau=320.0)], 16.0, 2) is None
+    assert gpfa.position_decay([dict(kind='const'), dict(kind='ou', tau=20.0)],
+                               16.0, 2) is None
+
+
+def test_the_cache_epoch_separates_frames_the_old_code_wrote():
+    from latent_gp.latents import LatentConfig
+    import latent_gp.latents as mod
+    base = dict(cells_path='x.parquet', n_dims=6, n_fast=1, fast_tau=20.0,
+                fast_kind='ou', slow_kind='const', bin_factor=8)
+    before = LatentConfig(**base).tag
+    old = mod.CACHE_EPOCH
+    try:
+        mod.CACHE_EPOCH = old - 1
+        assert LatentConfig(**base).tag != before
+    finally:
+        mod.CACHE_EPOCH = old

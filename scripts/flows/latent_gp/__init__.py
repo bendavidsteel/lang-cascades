@@ -1,7 +1,8 @@
 """Latent-GP factor model over cell-level stance counts."""
 
 __all__ = ['LatentConfig', 'build_latents', 'build_loadings', 'build_params',
-           'loading_matrix', 'coord_cols', 'fit_dir', 'reference']
+           'loading_matrix', 'coord_cols', 'fit_dir', 'reference',
+           'drop_prior_dominated']
 
 
 def __getattr__(name):

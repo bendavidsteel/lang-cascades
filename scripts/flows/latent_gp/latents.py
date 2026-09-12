@@ -42,7 +42,7 @@ import os
 import numpy as np
 import polars as pl
 
-from . import aggregate, calibrate, cells, fit as fit_mod, probs
+from . import aggregate, calibrate, cells, core, fit as fit_mod, probs
 
 
 # The singularity guard m_step has always used. At this value the loadings are
@@ -130,7 +130,14 @@ class LatentConfig:
             skip = skip | {'traj_col'}  # every fit that predates the handle key
         body = '|'.join(f'{f.name}={getattr(self, f.name)}'
                         for f in dataclasses.fields(self) if f.name not in skip)
-        return hashlib.blake2b(body.encode(), digest_size=6).hexdigest()
+        return hashlib.blake2b(f'{body}|epoch={CACHE_EPOCH}'.encode(),
+                               digest_size=6).hexdigest()
+
+
+# Bump when a change alters the frames a given configuration produces. The tag
+# hashes configuration and not code, so without this a fit written by the old
+# code is reused under the new code's key.
+CACHE_EPOCH = 2
 
 
 # what one fit produces, as indices into what _fit returns
@@ -422,9 +429,30 @@ def _fit(lcfg, spec, seed_split, log):
     Ez_c = (Ez_c - mu) / sd
     post_sd = np.sqrt(np.maximum(np.diagonal(Ezz, axis1=2, axis2=3), 0.0)) / sd
 
-    out = _to_frame(df, meta, Ez, Ez_c, post_sd, K, lcfg.interp_days)
+    decay = core.position_decay(comps, meta['dt'], K)
+    out = _to_frame(df, meta, Ez, Ez_c, post_sd, K, lcfg.interp_days, decay)
     return (_label(out, seed_split), _loading_frame(meta, r['W'], r['b'], mu, sd),
             _param_record(r['c'], mu, sd, meta, K))
+
+
+def drop_prior_dominated(df, sd_col, dims, max_sd, log=print):
+    """Drop seeds whose state is mostly prior rather than measurement.
+
+    Filtering whole seeds, not rows: dropping rows would punch holes in series
+    the unit root tests need contiguous. The latent is standardised to unit sd,
+    so a posterior sd near 1 means the data said nothing about that seed. This
+    is the volume filter too: sd is high exactly where `n_posts` is low, and
+    unlike a count it is on the same scale as the state being tested.
+    """
+    med = df.with_columns(
+        pl.col(sd_col).arr.to_list().list.gather(list(dims)).list.mean().alias('_sd')
+    ).group_by('filter_value').agg(pl.col('_sd').median().alias('_sd'))
+    keep = med.filter(pl.col('_sd') <= max_sd)['filter_value'].to_list()
+    log(f"  posterior sd filter (<= {max_sd:g}): keeping {len(keep)} of "
+        f"{med.height} seeds")
+    if len(keep) < 2:
+        raise ValueError(f'posterior sd filter at {max_sd} leaves no panel')
+    return df.filter(pl.col('filter_value').is_in(keep))
 
 
 def _label(out, seed_split):
@@ -495,7 +523,7 @@ def _project(lcfg, spec, seed_split, ref_seed_split, cache_root, log):
 
     post_sd = np.sqrt(np.maximum(np.diagonal(Ezz, axis1=2, axis2=3), 0.0)) / sd
     out = _to_frame(df, meta, (Ez - mu) / sd, (Ez_c - mu) / sd, post_sd, K,
-                    lcfg.interp_days)
+                    lcfg.interp_days, core.position_decay(comps, meta['dt'], K))
     return _label(out, seed_split), loadings, params
 
 
@@ -507,20 +535,52 @@ def _fine_grid(lo, hi, step):
     return np.repeat(np.arange(len(lo)), n), np.minimum(u, hi.repeat(n))
 
 
-def _interpolate(Ez, m_i, u, hi_i):
-    """Linear interpolation between bin centres.
+def _bridge_weights(w, decay):
+    """Weights on the two bracketing bin centres, under the prior.
 
-    Exact for this prior family: the smoothed mean of a Wiener process between
-    two grid points is the Brownian-bridge mean, which is linear in time, and a
-    constant component is trivially linear. Nothing is being approximated.
+    The smoothed mean between grid points is the prior bridge evaluated at the
+    posterior knots. For a reverting position that bridge sags toward zero, so
+    linear weights would overstate the state everywhere between bins; only a
+    non-reverting position (const, wiener) makes them exact. `decay` is the
+    per-dimension correlation across one bin, and the linear limit is recovered
+    as it goes to one.
     """
+    if decay is None:
+        return 1 - w, w
+    F = np.clip(np.asarray(decay, dtype=float)[None, :], 0.0, 1.0)
+    lin = F > 1 - 1e-9
+    den = np.where(lin, 1.0, 1 - F ** 2)
+    lo = np.where(lin, 1 - w, (F ** w - F ** (2 - w)) / den)
+    hi = np.where(lin, w, (F ** (1 - w) - F ** (1 + w)) / den)
+    return lo, hi
+
+
+def _interpolate(Ez, m_i, u, hi_i, decay=None):
+    """Smoothed state between bin centres, as the prior bridge between knots."""
     t_lo = np.floor(u).astype(int)
     t_hi = np.minimum(t_lo + 1, hi_i)
     w = (u - t_lo)[:, None]
-    return (1 - w) * Ez[m_i, t_lo] + w * Ez[m_i, t_hi]
+    lo, hi = _bridge_weights(w, decay)
+    return lo * Ez[m_i, t_lo] + hi * Ez[m_i, t_hi]
 
 
-def _to_frame(df, meta, Ez, Ez_c, post_sd, K, interp_days=0.0):
+def _extrapolate(Ez_c, m_i, u, decay=None):
+    """Filtered state between bin centres, as the forecast from the last one.
+
+    A bridge would read the knot ahead, and that knot has seen observations
+    later than the row being written -- which is the dependence the causal
+    column exists to avoid. Forecasting forward keeps it, and under a reverting
+    prior that forecast decays toward the prior mean rather than holding.
+    """
+    t_lo = np.floor(u).astype(int)
+    w = (u - t_lo)[:, None]
+    if decay is None:
+        return Ez_c[m_i, t_lo]
+    F = np.clip(np.asarray(decay, dtype=float)[None, :], 0.0, 1.0)
+    return (F ** w) * Ez_c[m_i, t_lo]
+
+
+def _to_frame(df, meta, Ez, Ez_c, post_sd, K, interp_days=0.0, decay=None):
     """Rows spanning each seed's observed bins, optionally on a finer grid.
 
     Bins outside the span carry no data at all, so their state is pure prior
@@ -549,8 +609,8 @@ def _to_frame(df, meta, Ez, Ez_c, post_sd, K, interp_days=0.0):
         't': t_i,
         'createtime': pl.Series(stamp).cast(pl.Datetime('us')),
         'filter_value': [meta['seeds'][m] for m in m_i],
-        c_coord: _interpolate(Ez, m_i, u, hi_i),
-        c_causal: _interpolate(Ez_c, m_i, u, hi_i),
+        c_coord: _interpolate(Ez, m_i, u, hi_i, decay),
+        c_causal: _extrapolate(Ez_c, m_i, u, decay),
         c_sd: post_sd[m_i, t_i],
     })
     return out.join(posts, on=['m', 't'], how='left') \
