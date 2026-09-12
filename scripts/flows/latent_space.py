@@ -325,9 +325,7 @@ def _precomputed(cfg, smooth):
 
     component_df = pl.read_parquet(
         os.path.join(trend_path, f'{cfg.dim_reduction_method}_metadata.parquet.zstd'))
-    if cfg.dim_reduction_method == 'sfa':
-        components = component_df.filter(pl.col('n_components') == n_dims)['W'][0].to_numpy()
-    elif cfg.dim_reduction_method in ['pca', 'ppca', 'pica']:
+    if cfg.dim_reduction_method in ['pca', 'ppca', 'pica']:
         components = np.stack(
             component_df.filter(pl.col('n_dims') == n_dims)['components'][0].to_numpy())
     else:
