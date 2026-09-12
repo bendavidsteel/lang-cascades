@@ -155,14 +155,14 @@ parameters:
     values: [const, wiener, ou]
   latents.slow_tau:
     values: [640.0, 2560.0]
-  # 8 was the largest value on offer and won monotonically over 4 and 2, so 16
-  # is here to find out whether that trend continues or the objective is simply
-  # rewarding a coarser grid. Treat a win at 16 with suspicion: the grid spacing
-  # is 2 * bin_factor days, so at 16 it cannot resolve the short fast_tau values
-  # that the same trials prefer. 2 is dropped -- worst of the three and four
-  # times the cells of 8, so most of a budget for the least of the evidence.
+  # Fixed, not swept. The grid spacing is 2 * bin_factor days and the fast
+  # prior's one-step correlation is exp(-dt / (2 * fast_tau)), so a coarser
+  # grid leaves adjacent bins nearly independent under the prior and the state
+  # between them is prior rather than measurement. 8 holds that above 0.45 at
+  # every fast_tau offered; 16 takes it to 0.20 at the short end. The values
+  # below 8 multiply the cells for a value that has never placed.
   latents.bin_factor:
-    values: [8, 16]
+    value: 8
   # See joint.yaml. Kept to the three values that bracket the measured decline,
   # since this sweep pays for a latent fit per value on top of a narrower grid.
   latents.w_ridge:
