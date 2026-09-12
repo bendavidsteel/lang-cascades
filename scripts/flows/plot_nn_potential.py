@@ -23,6 +23,9 @@ import sweep_runs
 from nn_potential import INITIAL_DATE, UNIT_DAYS, run_dir
 from pca_density import create_kde_background, get_top_component_features, format_pca_axis_label
 
+# a y label runs along the short side of a panel and is clipped unwrapped
+Y_LABEL_WRAP = 38
+
 
 def compute_marginalized_grad_phi(model, t, z_2d, dim_1, dim_2, marginal_samples,
                                   mc_dropout=None, key=None, n_marginal=256):
@@ -205,7 +208,8 @@ def setup_y_axis_labels(ax, components, feature_names, dim_2=1, weights=None):
     """Setup axis labels with PCA feature information and optional dimension descriptions"""
     top_features = get_top_component_features(components, feature_names,
                                               n_features=3, weights=weights)
-    y_label = format_pca_axis_label(dim_2 + 1, top_features[f'PC{dim_2 + 1}'])
+    y_label = format_pca_axis_label(dim_2 + 1, top_features[f'PC{dim_2 + 1}'],
+                                    wrap=Y_LABEL_WRAP)
     ax.set_ylabel(y_label, fontsize=8)
     
 
@@ -734,10 +738,6 @@ def main(cfg):
         'n_marginal': 256,
         'n_dims': cfg.n_dims,
         'target_weights': target_weights,
-        # the landscape figures show the flow field alone: the density and the
-        # uncertainty hatching sit on top of the streamlines and hide them
-        'show_kde': False,
-        'show_hatching': False,
     }
 
     PLATFORMS = ['twitter', 'tiktok', 'instagram', 'bluesky']
@@ -791,6 +791,10 @@ def main(cfg):
             plot_kwargs['show_y_axis_labels'] = (i == 0)
             plot_kwargs['show_x_tick_labels'] = True
             plot_kwargs['show_y_tick_labels'] = (i == 0)
+            # the flow field alone across a row: the density and the hatching
+            # are drawn over the streamlines and a small panel cannot carry both
+            plot_kwargs['show_kde'] = False
+            plot_kwargs['show_hatching'] = False
             plot_density_streamplot(fig, axes[i], model, target_df, components, stance_cols, **plot_kwargs)
             axes[i].set_title(f'{t_to_datetime(t_range[0]).strftime("%Y")}')
 
@@ -878,6 +882,8 @@ def main(cfg):
             platform_plot_kwargs['show_y_tick_labels'] = (i == 0)
             platform_plot_kwargs['show_x_axis_labels'] = True
             platform_plot_kwargs['show_y_axis_labels'] = (i == 0)
+            platform_plot_kwargs['show_kde'] = False
+            platform_plot_kwargs['show_hatching'] = False
 
             plot_density_streamplot(
                 fig, axes[i], platform_model, platform_df, components, stance_cols,

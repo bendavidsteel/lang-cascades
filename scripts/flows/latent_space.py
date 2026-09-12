@@ -164,6 +164,43 @@ def _quality(components, percentile, n_top, weights):
             'score': float(np.sqrt(max(prevalence, 0.0) * max(spread, 0.0)))}
 
 
+def dimension_priors(cfg):
+    """The GP prior each dimension was fitted under, as (kind, tau).
+
+    Read back through the same call the fit used, so the two cannot disagree
+    about which dimensions were the drifting ones. `tau` is in days -- the fit's
+    grid spacing is -- and is None for a frozen dimension.
+    """
+    from latent_gp import fit as fit_mod
+
+    lcfg = LatentConfig.from_cfg(cfg)
+    comps = fit_mod.prior_components(lcfg.n_dims, lcfg.n_fast, lcfg.fast_tau,
+                                     lcfg.slow_kind, lcfg.slow_tau,
+                                     fast_kind=lcfg.fast_kind)
+    # a homogeneous mix comes back as one shared list, a genuine mix per dimension
+    per_dim = comps if (comps and isinstance(comps[0], (list, tuple))) \
+        else [comps] * lcfg.n_dims
+    return [(c[0]['kind'], c[0].get('tau')) for c in per_dim]
+
+
+def dimension_variance_share(cfg):
+    """Each dimension's share of the variance it drives in the linear predictor.
+
+    PCA orders its axes by explained variance, so the index carries that
+    meaning; a GPFA fit does not order its axes at all. This is the closest
+    analogue: dimension k shifts a target's score by W[k] z_k, so it contributes
+    var(z_k) ||W[k]||^2. Cross-dimension covariance is left out, so the shares
+    partition the total only approximately.
+    """
+    if cfg.latents.method != 'gpfa':
+        return None
+    target_df, components, _ = load(cfg)
+    z = np.stack(target_df[COORD].to_numpy())
+    contrib = z.var(axis=0) * (np.asarray(components) ** 2).sum(axis=1)
+    total = contrib.sum()
+    return contrib / total if total > 0 else contrib
+
+
 def dimension_quality(cfg, n_top=TOP_TARGETS):
     """ranking_quality for the fit cfg names, off the loadings it cached."""
     if cfg.latents.method != 'gpfa':

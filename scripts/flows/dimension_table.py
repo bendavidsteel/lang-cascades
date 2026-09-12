@@ -10,6 +10,15 @@ import latent_space
 TABLE_END = """    \\bottomrule
 \\end{tabularx}"""
 
+
+def format_prior(kind, tau):
+    """One dimension's GP prior, short enough for a table cell."""
+    if kind == 'const':
+        return 'frozen'
+    names = {'ou': 'OU', 'wiener': 'Wiener', 'matern32': "Mat\\'ern 3/2",
+             'iwp2': 'IWP(2)'}
+    return f"{names.get(kind, kind)}, $\\tau$={tau:.0f}\\,d"
+
 @hydra.main(version_base=None, config_path="../../config", config_name="config")
 def main(cfg):
     logging.info("Loading data...")
@@ -27,19 +36,23 @@ def main(cfg):
     num_cats = 5
 
     if num_cats == 5:
-        TABLE_START = """\\begin{tabularx}{\\textwidth}{c|X|XXXXX}
+        TABLE_START = """\\begin{tabularx}{\\textwidth}{c|c|c|X|XXXXX}
 \\toprule 
-& & \\multicolumn{5}{c}{\\textbf{Description}} \\\\
-\\cmidrule(lr){3-7}
-\\textbf{Dim.} & \\textbf{Targets} & \\textbf{0-1\%} & \\textbf{1\% - 10\%} & \\textbf{10\% - 90\%} & \\textbf{90\% - 99\%} & \\textbf{99\% - 100\%} \\\\
+& & & & \\multicolumn{5}{c}{\\textbf{Description}} \\\\
+\\cmidrule(lr){5-9}
+\\textbf{Dim.} & \\textbf{Prior} & \\textbf{Var.} & \\textbf{Targets} & \\textbf{0-1\%} & \\textbf{1\% - 10\%} & \\textbf{10\% - 90\%} & \\textbf{90\% - 99\%} & \\textbf{99\% - 100\%} \\\\
 \\midrule"""
     elif num_cats == 3:
-        TABLE_START = """\\begin{tabularx}{\\textwidth}{c|X|XXX}
+        TABLE_START = """\\begin{tabularx}{\\textwidth}{c|c|c|X|XXX}
 \\toprule
-& & \\multicolumn{3}{c}{\\textbf{Description}} \\\\
-\\cmidrule(lr){3-5}
-\\textbf{Dim.} & \\textbf{Targets} & \\textbf{Negative} & \\textbf{Neutral} & \\textbf{Positive} \\\\
+& & & & \\multicolumn{3}{c}{\\textbf{Description}} \\\\
+\\cmidrule(lr){5-7}
+\\textbf{Dim.} & \\textbf{Prior} & \\textbf{Var.} & \\textbf{Targets} & \\textbf{Negative} & \\textbf{Neutral} & \\textbf{Positive} \\\\
 \\midrule"""
+
+    # the index is a name, not a rank: a gpfa fit does not order its axes
+    priors = latent_space.dimension_priors(cfg)
+    shares = latent_space.dimension_variance_share(cfg)
 
     table_lines = [TABLE_START]
 
@@ -65,7 +78,9 @@ def main(cfg):
             ]
         text_labels = [lbl.replace('&', '\\&') for lbl in text_labels]
 
-        line = f"       {dim_idx+1} & "
+        kind, tau = priors[dim_idx]
+        share = '--' if shares is None else f"{100 * shares[dim_idx]:.0f}\\%"
+        line = f"       {dim_idx+1} & {format_prior(kind, tau)} & {share} & "
         top_targets = labels['top_features'][5:].split(', ')[:4]
         top_targets = [t.replace('&', '\\&') for t in top_targets]
         line += ',\\newline '.join(top_targets) + " & "
