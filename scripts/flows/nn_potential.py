@@ -14,6 +14,7 @@ import polars as pl
 import wandb
 from tqdm import tqdm
 
+import drift_linearity
 import latent_space
 import splits
 from latent_gp import LatentConfig
@@ -839,6 +840,17 @@ def main(cfg):
     # it. Every downstream script loads the newest, so write the scored model
     # last and they get the one these metrics describe.
     model.save(os.path.join(dir_path, 'states', 'model_best.pth'), hyperparams)
+
+    # A field one linear map reproduces has learned no landscape: momentum
+    # cannot predict reversion, so a uniform pull inward scores against it
+    # without explaining anything. Logged, not optimised.
+    held = splits.select(labelled, 'val', 'out')
+    for k, v in drift_linearity.report(
+            model,
+            held['t0'].to_numpy().astype(np.float32),
+            held['x0'].to_numpy().astype(np.float32)).items():
+        wandb.run.summary[k] = v
+        logger.info(f'{k} = {v:.4f}')
 
     seed_df = load_seed_metadata(cfg)
     key, evalkey = jax.random.split(key)
