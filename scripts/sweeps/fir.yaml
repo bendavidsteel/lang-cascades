@@ -81,6 +81,14 @@ parameters:
   latents.causal_state:
     value: true
 
+  # Constant-step Euler-Maruyama. 'heun' is the only solver wired to an
+  # adaptive controller, and a rejected step there is not bounded by dtmin the
+  # way an accepted one is: with throw=False a stiffening field silently burns
+  # max_steps per pair, which is minutes rather than milliseconds. Step size
+  # comes from dt, capped at a quarter of the pair's span.
+  solver:
+    value: euler
+
   # Rows between bin centres are forecast forward from the last one under
   # causal_state, so they carry no observation of their own. Resampling would
   # make seven of every eight one-step displacements the prior's decay.

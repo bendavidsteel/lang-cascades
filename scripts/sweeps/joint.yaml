@@ -38,9 +38,9 @@ metric:
   goal: maximize
 
 # Without this the search never ends: five parameters are continuous, so the
-# space cannot be exhausted the way a grid can. One card turns over about 19
-# trials a day, so this is a bit under a week.
-run_cap: 120
+# space cannot be exhausted the way a grid can. A card turns over about ten
+# trials an hour now, so two cards reach this in a bit over a day.
+run_cap: 600
 
 command:
   - ${env}
@@ -52,7 +52,7 @@ command:
   # healthy trials rather than stalled ones -- which is what cost the first
   # sweep two thirds of its yield. patience keeps the typical trial far inside
   # this, so the slack is only ever paid by the trials that need it.
-  - "14400"
+  - "3600"
   - python
   - ${program}
   - ${args_no_hyphens}
@@ -84,6 +84,14 @@ parameters:
   # forecast claim, and trials across the two are not comparable.
   latents.causal_state:
     value: true
+
+  # Constant-step Euler-Maruyama. 'heun' is the only solver wired to an
+  # adaptive controller, and a rejected step there is not bounded by dtmin the
+  # way an accepted one is: with throw=False a stiffening field silently burns
+  # max_steps per pair, which is minutes rather than milliseconds. Step size
+  # comes from dt, capped at a quarter of the pair's span.
+  solver:
+    value: euler
 
   # Rows between bin centres are forecast forward from the last one under
   # causal_state, so they carry no observation of their own. Resampling would
