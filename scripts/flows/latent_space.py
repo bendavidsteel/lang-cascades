@@ -164,6 +164,15 @@ def _quality(components, percentile, n_top, weights):
             'score': float(np.sqrt(max(prevalence, 0.0) * max(spread, 0.0)))}
 
 
+def axis_prefix(cfg):
+    """What to call one axis of the representation.
+
+    A gpfa axis is a latent dimension, which the write-up abbreviates LD; only
+    the precomputed methods produce principal components.
+    """
+    return 'LD' if cfg.latents.method == 'gpfa' else 'PC'
+
+
 def dimension_priors(cfg):
     """The GP prior each dimension was fitted under, as (kind, tau).
 

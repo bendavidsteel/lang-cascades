@@ -81,7 +81,8 @@ def main(cfg):
         kind, tau = priors[dim_idx]
         share = '--' if shares is None else f"{100 * shares[dim_idx]:.0f}\\%"
         line = f"       {dim_idx+1} & {format_prior(kind, tau)} & {share} & "
-        top_targets = labels['top_features'][5:].split(', ')[:4]
+        # drop the axis name the label opens with, however long it is
+        top_targets = labels['top_features'].partition('(')[2].split(', ')[:4]
         top_targets = [t.replace('&', '\\&') for t in top_targets]
         line += ',\\newline '.join(top_targets) + " & "
         if num_cats == 5:

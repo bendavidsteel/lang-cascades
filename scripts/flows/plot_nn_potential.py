@@ -192,7 +192,8 @@ def load_dimension_labels(dimension_labels_path):
         return json.load(f)
 
 
-def setup_x_axis_labels(ax, components, feature_names, dim_1=0, weights=None):
+def setup_x_axis_labels(ax, components, feature_names, dim_1=0, weights=None,
+                        prefix='PC'):
     """Setup axis labels with PCA feature information and optional dimension descriptions
 
     `weights` is latents.rank_by_volume's, so an axis is named by the same
@@ -201,15 +202,17 @@ def setup_x_axis_labels(ax, components, feature_names, dim_1=0, weights=None):
     """
     top_features = get_top_component_features(components, feature_names,
                                               n_features=3, weights=weights)
-    x_label = format_pca_axis_label(dim_1 + 1, top_features[f'PC{dim_1 + 1}'])
+    x_label = format_pca_axis_label(dim_1 + 1, top_features[f'PC{dim_1 + 1}'],
+                                    prefix=prefix)
     ax.set_xlabel(x_label, fontsize=8)
 
-def setup_y_axis_labels(ax, components, feature_names, dim_2=1, weights=None):
+def setup_y_axis_labels(ax, components, feature_names, dim_2=1, weights=None,
+                        prefix='PC'):
     """Setup axis labels with PCA feature information and optional dimension descriptions"""
     top_features = get_top_component_features(components, feature_names,
                                               n_features=3, weights=weights)
     y_label = format_pca_axis_label(dim_2 + 1, top_features[f'PC{dim_2 + 1}'],
-                                    wrap=Y_LABEL_WRAP)
+                                    wrap=Y_LABEL_WRAP, prefix=prefix)
     ax.set_ylabel(y_label, fontsize=8)
     
 
@@ -446,6 +449,7 @@ def animate_density_streamplot(
         n_marginal=256,
         n_dims=21,
         target_weights=None,
+        axis_prefix='PC',
     ):
     coord_col = f'coord_{n_dims}d'
     fig, ax = plt.subplots(1, 1, figsize=(12, 10))
@@ -483,9 +487,9 @@ def animate_density_streamplot(
 
     # Setup axis labels
     setup_x_axis_labels(ax, components, feature_names, dim_1=0,
-                        weights=target_weights)
+                        weights=target_weights, prefix=axis_prefix)
     setup_y_axis_labels(ax, components, feature_names, dim_2=1,
-                        weights=target_weights)
+                        weights=target_weights, prefix=axis_prefix)
 
     show_x_dim_labels(ax, dimension_labels, dim=0)
     show_y_dim_labels(ax, dimension_labels, dim=1)
@@ -512,9 +516,9 @@ def animate_density_streamplot(
 
         # Re-add axis labels and title
         setup_x_axis_labels(ax, components, feature_names, dim_1=0,
-                        weights=target_weights)
+                        weights=target_weights, prefix=axis_prefix)
         setup_y_axis_labels(ax, components, feature_names, dim_2=1,
-                        weights=target_weights)
+                        weights=target_weights, prefix=axis_prefix)
 
         show_x_dim_labels(ax, dimension_labels, dim=0)
         show_y_dim_labels(ax, dimension_labels, dim=1)
@@ -585,6 +589,7 @@ def plot_density_streamplot(
         show_kde=True,
         show_hatching=True,
         target_weights=None,
+        axis_prefix='PC',
         **kwargs
     ):
     coord_col = f'coord_{n_dims}d'
@@ -620,10 +625,10 @@ def plot_density_streamplot(
     # Setup axis labels (conditionally)
     if show_x_axis_labels:
         setup_x_axis_labels(ax, components, feature_names, dim_1=dim_1,
-                            weights=target_weights)
+                            weights=target_weights, prefix=axis_prefix)
     if show_y_axis_labels:
         setup_y_axis_labels(ax, components, feature_names, dim_2=dim_2,
-                            weights=target_weights)
+                            weights=target_weights, prefix=axis_prefix)
 
     if show_x_tick_labels:
         # Still set up tick labels without axis labels
@@ -738,6 +743,7 @@ def main(cfg):
         'n_marginal': 256,
         'n_dims': cfg.n_dims,
         'target_weights': target_weights,
+        'axis_prefix': latent_space.axis_prefix(cfg),
     }
 
     PLATFORMS = ['twitter', 'tiktok', 'instagram', 'bluesky']
@@ -935,10 +941,10 @@ def main(cfg):
             )
 
         setup_x_axis_labels(ax, components, stance_cols, dim_1=0,
-                            weights=target_weights)
+                            weights=target_weights, prefix=axis_prefix)
         show_x_dim_labels(ax, dimension_labels, dim=0)
         setup_y_axis_labels(ax, components, stance_cols, dim_2=1,
-                            weights=target_weights)
+                            weights=target_weights, prefix=axis_prefix)
         show_y_dim_labels(ax, dimension_labels, dim=1)
 
         x_range = (np.percentile(coords[:,0], 0.5), np.percentile(coords[:,0], 99.5))

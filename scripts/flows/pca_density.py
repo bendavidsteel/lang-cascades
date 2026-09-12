@@ -81,14 +81,14 @@ def get_top_component_features(components, feature_names, n_features=3,
     return top_features
 
 def format_pca_axis_label(component_num, top_features, max_chars=100,
-                          wrap=None):
+                          wrap=None, prefix='PC'):
     """Format axis label with top contributing features.
 
     `wrap` breaks the loading list over lines of that width. A y label runs
     along the shorter side of a wide panel, where one long line overruns the
     axes and is clipped.
     """
-    base_label = f'PC{component_num}'
+    base_label = f'{prefix}{component_num}'
     
     # Format feature contributions
     feature_strs = []

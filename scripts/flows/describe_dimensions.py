@@ -71,7 +71,8 @@ def get_user_documents(df: pl.DataFrame, text_df: pl.DataFrame, pca_feature_df: 
 def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_features: list, text_df: pl.DataFrame,
                               embedding_model, llm, num_cats=5,
                               n_exemplars=32, n_keyphrases=32,
-                              exemplar_selection_method='random', filter_val_col='SeedName'):
+                              exemplar_selection_method='random', filter_val_col='SeedName',
+                              axis_prefix='PC'):
     dim_col = f'dim_{dim}'
     pca_feature_df = pl.from_records(dim_pca_features, schema={'Target': pl.String, 'Loading': pl.Float32})
     if num_cats == 5:
@@ -243,7 +244,8 @@ def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_feature
     )
     # topic_names_list = [['Topic A', 'Topic B', 'Topic C', 'Topic D', 'Topic E']] if num_cats == 5 else [['Topic A', 'Topic B', 'Topic C']]  
 
-    target_names = format_pca_axis_label(dim, dim_pca_features)
+    target_names = format_pca_axis_label(dim, dim_pca_features,
+                                         prefix=axis_prefix)
     logger.info(f"Target names for dimension {dim}: {target_names}")
 
     if num_cats == 5:
@@ -376,7 +378,8 @@ def get_dimension_descriptions(target_df: pl.DataFrame, pca_features, cfg):
             n_exemplars=n_exemplars,
             n_keyphrases=n_keyphrases,
             exemplar_selection_method=exemplar_selection_method,
-            filter_val_col=cfg.filter_column
+            filter_val_col=cfg.filter_column,
+            axis_prefix=latent_space.axis_prefix(cfg)
         )
         dimension_labels[dim]['3_cat'] = dim_desc
         dim_desc = get_dimension_description(
@@ -390,7 +393,8 @@ def get_dimension_descriptions(target_df: pl.DataFrame, pca_features, cfg):
             n_exemplars=n_exemplars,
             n_keyphrases=n_keyphrases,
             exemplar_selection_method=exemplar_selection_method,
-            filter_val_col=cfg.filter_column
+            filter_val_col=cfg.filter_column,
+            axis_prefix=latent_space.axis_prefix(cfg)
         )
         dimension_labels[dim]['5_cat'] = dim_desc
 
