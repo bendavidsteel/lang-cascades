@@ -756,12 +756,17 @@ def main(cfg):
     valid_dataloader = NumpyLoader(
         valid_dataset, batch_size=min(batch_size, len(valid_dataset)), shuffle=False)
 
+    # Boundaries are epoch counts, not fractions of training, so the stepped
+    # schedule drops dt tenfold after the first epoch and every later epoch
+    # integrates at ten times the cost. dt is capped at a quarter of the pair's
+    # span already, and the refinement it buys is far below the noise.
     scheduler_kwargs = {
         'dt': cfg.dt,
         'dt_schedule_bounds': [0, 1],
         'dt_schedule_scales': [1.0, 0.1]
     }
-    dt_schedule = get_dt_schedule('stepped', scheduler_kwargs)
+    dt_schedule = get_dt_schedule(cfg.get('dt_schedule', 'constant'),
+                                  scheduler_kwargs)
 
     rng = np.random.default_rng(seed=42)
     key = jax.random.PRNGKey(int(rng.integers(2**32)))
