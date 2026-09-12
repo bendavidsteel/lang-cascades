@@ -38,21 +38,20 @@ metric:
   goal: maximize
 
 # Without this the search never ends: five parameters are continuous, so the
-# space cannot be exhausted the way a grid can. A card turns over about ten
-# trials an hour now, so two cards reach this in a bit over a day.
-run_cap: 600
+# space cannot be exhausted the way a grid can. A card turns over roughly a
+# trial an hour, so two cards reach this in about a week.
+run_cap: 300
 
 command:
   - ${env}
   - timeout                     # a stalled trial must not block its agent
-  # The rebuilt aggregate has half again as many pairs, so an epoch now runs
-  # ~70s at batch_size 512 and about twice that at 256, and the latent fit
-  # costs 12-20 min depending on the grid. A hundred epochs at the small batch
-  # size therefore lands past 10800s, and a budget under the trial kills
-  # healthy trials rather than stalled ones -- which is what cost the first
-  # sweep two thirds of its yield. patience keeps the typical trial far inside
-  # this, so the slack is only ever paid by the trials that need it.
-  - "3600"
+  # Set from the slowest corner of the grid: an epoch at batch_size 256 runs
+  # about three times one at 1024, and the latent fit a cache miss pays for
+  # sits on top. A budget under the trial censors that corner rather than
+  # catching stalls -- which is what cost the first sweep two thirds of its
+  # yield. patience keeps the typical trial far inside this, so the slack is
+  # only ever paid by the trials that need it.
+  - "9000"
   - python
   - ${program}
   - ${args_no_hyphens}
