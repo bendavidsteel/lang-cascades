@@ -286,6 +286,16 @@ def _gpfa(cfg, spec=None):
     lcfg, spec, kw = fit_args(cfg, spec=spec)
 
     coord, causal, sd = coord_cols(lcfg.n_dims)
+    # A row between bin centres is forecast forward from the last one, so it
+    # carries no observation and its displacement is the prior's decay alone.
+    # The smoothed column reads both knots and may be resampled; this one may
+    # not.
+    if cfg.latents.causal_state and lcfg.interp_days > 0:
+        raise ValueError(
+            f'causal_state with interp_days={lcfg.interp_days}: '
+            f'{1 - lcfg.interp_days / (2 * lcfg.bin_factor):.0%} of one-step '
+            'displacements would be the prior rather than the data. Set '
+            'latents.interp_days=0.')
     state = causal if cfg.latents.causal_state else coord
     # the fast block is where the motion is, so a seed whose fast dims are
     # prior rather than measurement contributes the prior's dynamics and not

@@ -80,6 +80,12 @@ parameters:
   latents.causal_state:
     value: true
 
+  # Rows between bin centres are forecast forward from the last one under
+  # causal_state, so they carry no observation of their own. Resampling would
+  # make seven of every eight one-step displacements the prior's decay.
+  latents.interp_days:
+    value: 0
+
 
   # --- stance observation model ---
   # How much of the classifier's output the latent fit sees. On the GPFA's own
