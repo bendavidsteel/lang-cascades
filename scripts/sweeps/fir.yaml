@@ -14,7 +14,6 @@
 # Measured means from that sweep, which is where the cuts come from:
 #   phi_hidden_dims  [64,64,64] 0.75h   [128x4] 1.32h   [256,256,256] 1.83h
 #   obs_model        hard 0.90h   channel 1.14h   soft 1.04h
-#   batch_size       1024 0.79h   512 1.21h   256 1.63h
 #   bin_factor       8 0.85h   4 1.48h   2 1.57h
 #
 # bin_factor is the cut that costs least: every one of the ten best trials used
@@ -216,5 +215,10 @@ parameters:
     max: 0.2
   phi_hidden_dims:
     values: ["[64,64,64]", "[128,128,128,128]"]
+  # Fixed, not swept. Across 250 finished trials the objective is monotone in
+  # it and every one of the top fifteen sat at 1024, well past what the search's
+  # own allocation to that value would produce. It is also the cheapest: the
+  # card is not saturated below it, so a smaller batch costs nearly as much per
+  # step while taking more of them.
   batch_size:
-    values: [512, 1024]
+    value: 1024

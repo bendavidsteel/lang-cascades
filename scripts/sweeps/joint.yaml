@@ -45,12 +45,11 @@ run_cap: 300
 command:
   - ${env}
   - timeout                     # a stalled trial must not block its agent
-  # Set from the slowest corner of the grid: an epoch at batch_size 256 runs
-  # about three times one at 1024, and the latent fit a cache miss pays for
-  # sits on top. A budget under the trial censors that corner rather than
-  # catching stalls -- which is what cost the first sweep two thirds of its
-  # yield. patience keeps the typical trial far inside this, so the slack is
-  # only ever paid by the trials that need it.
+  # Set from the slowest corner of the grid: the widest phi at a hundred epochs,
+  # plus the latent fit a cache miss pays for. A budget under the trial censors
+  # that corner rather than catching stalls -- which is what cost the first
+  # sweep two thirds of its yield. patience keeps the typical trial far inside
+  # this, so the slack is only ever paid by the trials that need it.
   - "9000"
   - python
   - ${program}
@@ -230,5 +229,10 @@ parameters:
     max: 0.2
   phi_hidden_dims:
     values: ["[64,64,64]", "[128,128,128,128]", "[256,256,256]"]
+  # Fixed, not swept. Across 250 finished trials the objective is monotone in
+  # it and every one of the top fifteen sat at 1024, well past what the search's
+  # own allocation to that value would produce. It is also the cheapest: the
+  # card is not saturated below it, so a smaller batch costs nearly as much per
+  # step while taking more of them.
   batch_size:
-    values: [256, 512, 1024]
+    value: 1024
