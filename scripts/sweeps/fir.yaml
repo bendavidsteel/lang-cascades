@@ -65,8 +65,13 @@ parameters:
     value: 100
   patience:
     value: 10
+  # 96 rather than 90: rows sit on the bin grid, so build_horizon_pairs shifts
+  # by round(horizon / (2 * bin_factor)) rows and 90 days lands on 96 anyway.
+  # Naming it 96 keeps the label and the measurement the same number.
   eval_horizons:
-    value: "[90]"
+    value: "[96]"
+  objective_prefix:
+    value: horizon_96d
   breakdown_scenario:
     value: "null"
   # The landscape is fitted to displacements of whichever state this selects, so

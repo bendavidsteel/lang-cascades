@@ -878,6 +878,10 @@ def main(cfg):
     obj_key = f'{cfg.objective_prefix}/{cfg.objective_scenario}/{cfg.objective_metric}'
     objective = scored.get(cfg.objective_prefix, {}) \
         .get(cfg.objective_scenario, {}).get(cfg.objective_metric)
+    if cfg.objective_prefix not in scored:
+        raise ValueError(
+            f'objective_prefix {cfg.objective_prefix} was never scored; '
+            f'eval_horizons {list(cfg.eval_horizons)} produced {sorted(scored)}')
     if objective is None:
         logger.warning(f'objective {obj_key} unavailable; '
                        'the sweep has nothing to optimise')
