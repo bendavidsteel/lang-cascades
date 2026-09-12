@@ -1,8 +1,11 @@
 # Sweep for Fir, where a job is two hours on one H100.
 #
 # Same search as joint.yaml, restricted to the configurations that finish well
-# inside a two-hour allocation. The restriction is not a compromise about what
-# is worth exploring: runtime on these trials is driven entirely by the
+# inside a two-hour allocation, and to a prior that does not mean-revert --
+# see latents.fast_kind below. joint.yaml keeps the reverting kinds.
+#
+# The runtime restriction is not a compromise about what is worth
+# exploring: runtime on these trials is driven entirely by the
 # structural settings, and every continuous parameter is flat against it
 # (|r| < 0.17 over 44 trials). Dropping the expensive end of four discrete axes
 # therefore buys a large speedup at a known cost in coverage, and prometheus
@@ -127,11 +130,14 @@ parameters:
   # weighting but collapses onto the pooled value when only one axis moves, so
   # read spurious_drift_ratio and baseline_mse beside both.
   #
-  # fast_kind decides whether a drifting dimension is confined. Both kinds are
-  # rough and their tau means the same thing, so the pair isolates confinement.
-  # On the GPFA's own held-out blocks a homogeneous OU at tau=80 took the best
-  # forecast RPS and log score of nine priors tried, beating the Wiener at every
-  # matched tau, so it is on the menu here rather than assumed.
+  # Fixed at wiener here, and this arm is the reason. A reverting prior writes
+  # its own reversion into the state between observations, and a linear field
+  # fitted to the 90-day displacements picks that up: swapping ou for wiener
+  # takes the smoothed column from R2 0.36 to 0.08. Since momentum cannot
+  # predict reversion, a landscape that learns nothing but the prior still
+  # beats the baseline, so ou's lead on the objective is not yet evidence of
+  # anything. Neither is the slow block, which is why it drops its ou too.
+  # Prometheus runs the paired ou/wiener check that settles it.
   #
   # n_fast=6 is >= every n_dims offered, which is how a homogeneous mix is
   # reached: the winning prior was homogeneous, and a per-dimension mix cannot
@@ -141,7 +147,7 @@ parameters:
   latents.n_fast:
     values: [1, 2, 3, 4, 6]
   latents.fast_kind:
-    values: [wiener, ou]
+    value: wiener
   latents.fast_tau:
     values: [10.0, 20.0, 40.0, 80.0]
   # Confining the slow dimensions turned out to matter more than whether they
@@ -152,7 +158,7 @@ parameters:
   # would not revert once inside the span of the data and the option would be a
   # null test; 640 is where the gain above was measured.
   latents.slow_kind:
-    values: [const, wiener, ou]
+    values: [const, wiener]
   latents.slow_tau:
     values: [640.0, 2560.0]
   # Fixed, not swept. The grid spacing is 2 * bin_factor days and the fast
