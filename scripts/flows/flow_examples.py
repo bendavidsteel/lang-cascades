@@ -15,7 +15,25 @@ logger = logging.getLogger(__name__)
 def load_text_df(cfg, columns=['id', 'createtime', 'seed', 'Document', 'Targets', 'Stances']):
     dir_path = cfg.base_stance_path
     df = pl.read_parquet([os.path.join(dir_path, file_name) for file_name in os.listdir(dir_path) if file_name.endswith('.parquet.zstd')], columns=columns)
+    # The corpus stamps createtime UTC-aware, a gpfa latent's is naive off the
+    # aggregate's bin grid; polars picks no supertype for the two, so every
+    # comparison against a trajectory's window fails unless this side is naive.
+    if df.schema['createtime'].time_zone is not None:
+        df = df.with_columns(pl.col('createtime').dt.convert_time_zone('UTC')
+                             .dt.replace_time_zone(None))
     return df
+
+
+def covered_years(target_df):
+    """Years whose mid-year the trajectories reach, for the sliding windows.
+
+    The corpus grows, so a hard-coded list stops analysing the newest year
+    without saying so.
+    """
+    lo = target_df['createtime'].min()
+    hi = target_df['createtime'].max()
+    return [y for y in range(lo.year, hi.year + 1)
+            if lo <= datetime.datetime(y, 7, 1) <= hi]
 
 
 def compute_movement_per_user(target_df: pl.DataFrame, dim_idx: int, per_year: bool = True) -> pl.DataFrame:
@@ -63,11 +81,19 @@ def get_percentile_movers(movement_df: pl.DataFrame, direction: str, percentile:
     return get_top_movers(movement_df, direction, n_top)
 
 
-def get_heavy_loading_targets(components: np.ndarray, targets: list, dim_idx: int, n_targets: int = 5) -> list:
-    """Get targets that load heavily on a specific dimension."""
+def get_heavy_loading_targets(components: np.ndarray, targets: list, dim_idx: int, n_targets: int = 5,
+                              weights: np.ndarray = None) -> list:
+    """Get targets that load heavily on a specific dimension.
+
+    `weights` is a per-target post count. The fit constrains a low-volume
+    target's loading barely at all, so ranking on magnitude alone puts those at
+    the top; sqrt(weights) ranks by the target's share of the variance the
+    dimension drives instead. Reported loadings are unweighted either way.
+    """
     component = components[dim_idx]
     abs_loadings = np.abs(component)
-    top_indices = np.argsort(abs_loadings)[-n_targets:][::-1]
+    score = abs_loadings if weights is None else abs_loadings * np.sqrt(weights)
+    top_indices = np.argsort(score)[-n_targets:][::-1]
 
     return [
         {
@@ -370,24 +396,28 @@ def analyze_dimension_movements(
     components: np.ndarray,
     targets: list,
     filter_col: str,
-    platforms=None,
     n_dims: int = 3,
-    years: list = [2022, 2023, 2024, 2025],
+    years: list = None,
     n_top_movers: int = 3,
     n_candidate_movers: int = 50,
     n_heavy_targets: int = 5,
     percentiles: list = [0.01, 0.10],
-    per_year: bool = True
+    per_year: bool = True,
+    axis_prefix: str = 'LD',
+    target_weights: np.ndarray = None
 ):
     """Analyze movement patterns across dimensions, time periods, and directions."""
     results = {}
+    if years is None:
+        years = covered_years(target_df)
 
     for dim_idx in range(n_dims):
-        dim_name = f'PC{dim_idx + 1}'
+        dim_name = f'{axis_prefix}{dim_idx + 1}'
         results[dim_name] = {}
 
         # Get heavy loading targets for this dimension
-        heavy_targets = get_heavy_loading_targets(components, targets, dim_idx, n_heavy_targets)
+        heavy_targets = get_heavy_loading_targets(components, targets, dim_idx, n_heavy_targets,
+                                                  weights=target_weights)
 
         # Build dict of time periods to analyze
         if per_year:
@@ -605,6 +635,7 @@ def write_latex_table(results: dict, output_path: str):
     lines.append("\\bottomrule")
     lines.append("\\end{tabular}")
 
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
     with open(output_path, 'w') as f:
         f.write('\n'.join(lines))
     logger.info(f"LaTeX table written to {output_path}")
@@ -619,27 +650,37 @@ def main(cfg):
     # a frozen dimension has no movement to rank movers by
     n_moving = latent_space.n_moving_dims(cfg)
     n_short, n_long = min(2, n_moving), min(3, n_moving)
+    prefix = latent_space.axis_prefix(cfg)
+    # ranked the way the dimension table names its dimensions, so the targets a
+    # mover's stance changes are read on are the ones the axis is named after
+    weights = (latent_space.target_volumes(cfg, targets)
+               if cfg.latents.get('rank_by_volume', True) else None)
 
     logger.info("Loading text data for stance analysis...")
+    # a gpfa run keys trajectories by latents.traj_col, not by filter_column
+    filter_col = latent_space.traj_col(cfg)
     text_df = load_text_df(cfg)
-    text_df = text_df.with_columns(pl.col('seed').struct.field(cfg.filter_column)).drop('seed')
+    text_df = text_df.with_columns(pl.col('seed').struct.field(filter_col)).drop('seed')
 
-    if cfg.filter_column == 'SeedName':
+    if filter_col == 'SeedName':
+        years = covered_years(target_df)
         logger.info(f"Analyzing per-year movements ({n_short} dimensions)...")
         per_year_results = analyze_dimension_movements(
             target_df=target_df,
             text_df=text_df,
             components=components,
             targets=targets,
-            filter_col=cfg.filter_column,
+            filter_col=filter_col,
             n_dims=n_short,
-            years=[2022, 2023, 2024, 2025],
+            years=years,
             n_top_movers=3,
             n_heavy_targets=100,
-            per_year=True
+            per_year=True,
+            axis_prefix=prefix,
+            target_weights=weights
         )
-        print_analysis_results(per_year_results, title=f"PER-YEAR ANALYSIS (PC1-PC{n_short})")
-        for year in [2022, 2023, 2024, 2025]:
+        print_analysis_results(per_year_results, title=f"PER-YEAR ANALYSIS ({prefix}1-{prefix}{n_short})")
+        for year in years:
             year_results = {dim: {k: v for k, v in data.items() if k == year} for dim, data in per_year_results.items()}
             write_latex_table(year_results, f'./out/per_year_stance_changes_{year}.tex')
 
@@ -649,15 +690,17 @@ def main(cfg):
             text_df=text_df,
             components=components,
             targets=targets,
-            filter_col=cfg.filter_column,
+            filter_col=filter_col,
             n_dims=n_long,
             n_top_movers=3,
             n_heavy_targets=100,
-            per_year=False
+            per_year=False,
+            axis_prefix=prefix,
+            target_weights=weights
         )
-        print_analysis_results(all_time_results, title=f"ALL-TIME ANALYSIS (PC1-PC{n_long})")
+        print_analysis_results(all_time_results, title=f"ALL-TIME ANALYSIS ({prefix}1-{prefix}{n_long})")
         write_latex_table(all_time_results, './out/all_time_stance_changes.tex')
-    elif cfg.filter_column == 'PlatformHandleID':
+    elif filter_col == 'PlatformHandleID':
         for platform in ['twitter', 'instagram', 'bluesky', 'tiktok']:
             platform_target_df = target_df.filter(
                 pl.col('filter_value').cast(pl.String)\
@@ -665,7 +708,7 @@ def main(cfg):
                     .str.contains(f'-{platform}-')
             )
             platform_text_df = text_df.filter(
-                pl.col(cfg.filter_column).cast(pl.String)\
+                pl.col(filter_col).cast(pl.String)\
                     .str.to_lowercase()\
                     .str.contains(f'-{platform}-')
             )
@@ -680,13 +723,15 @@ def main(cfg):
                 text_df=platform_text_df,
                 components=components,
                 targets=targets,
-                filter_col=cfg.filter_column,
+                filter_col=filter_col,
                 n_dims=n_short,
                 n_top_movers=3,
                 n_heavy_targets=100,
-                per_year=False
+                per_year=False,
+                axis_prefix=prefix,
+                target_weights=weights
             )
-            print_analysis_results(platform_results, title=f"{platform.upper()} PLATFORM ANALYSIS (PC1-PC{n_short})")
+            print_analysis_results(platform_results, title=f"{platform.upper()} PLATFORM ANALYSIS ({prefix}1-{prefix}{n_short})")
             write_latex_table(platform_results, f'./out/{platform}_platform_stance_changes.tex')
 
 if __name__ == '__main__':

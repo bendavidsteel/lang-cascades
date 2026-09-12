@@ -220,6 +220,18 @@ def dimension_quality(cfg, n_top=TOP_TARGETS):
     return ranking_quality(components, target_volumes(cfg, targets), n_top)
 
 
+def traj_col(cfg):
+    """The seed field one trajectory is keyed by.
+
+    A gpfa fit aggregates by cfg.latents.traj_col, which need not be the
+    cfg.filter_column the precomputed coords were built over; joining a
+    trajectory back to its posts on the wrong one matches nothing at all.
+    """
+    if cfg.latents.method != 'gpfa':
+        return cfg.filter_column
+    return LatentConfig.from_cfg(cfg).traj_col
+
+
 def keep_platform(cfg, df):
     """Trajectories belonging to cfg.platform, or all of them when 'all'.
 
