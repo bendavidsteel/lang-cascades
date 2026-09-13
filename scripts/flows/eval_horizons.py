@@ -15,13 +15,23 @@ import splits
 
 
 HORIZON_DAYS = [7, 14, 30, 60, 120, 240, 360, 720]
+# Cells of the nested trajectory x time split, and what each one demonstrates.
+# The landscape is always fitted on train_in (nn_potential labels its pairs with
+# splits.label_pairs whatever cfg.split_type says), so these are the three
+# distinct ways of being held out from it. train_in itself is not reported: it
+# is the fit, not a result.
+SCENARIOS = (
+    ('test_in', 'Interpolation', 'unseen trajectories, seen time'),
+    ('train_out', 'Forecast', 'seen trajectories, unseen time'),
+    ('test_out', 'Zero-shot forecast', 'unseen trajectories, unseen time'),
+)
 # Minimum rolling-mean history (incl. t0) for a pair to enter the time-series
 # sample. Kept low so we don't bias toward long-running trajectories — the
 # landscape model has no such requirement, and 5 points is enough for ETS
 # damped-trend / Theta-2 to identify their parameters.
 MIN_HISTORY = 5
-# Target sample size per horizon. Pairs are drawn uniformly from the full val
-# pool (same population the landscape model is evaluated on).
+# Target sample size per horizon. Pairs are drawn uniformly from the whole
+# scenario cell (same population the landscape model is evaluated on).
 PAIRS_PER_HORIZON = 30_000
 ETS_SAMPLE_SEED = 42
 # Gardner-McKenzie damping factor for Theta-2's trend extrapolation. Standard
@@ -38,8 +48,8 @@ MODEL_PAIR_COLS = {'horizon', 'model_loss', 'baseline_loss'}
 # landscape model is trained/evaluated on, so the two methods predict the same
 # target. Uses a per-trajectory shift_n derived from each trajectory's own
 # median spacing. No-movement baseline is computed on the *same* subsample (so
-# the ETS ratio is fair). The landscape model is evaluated on the full val set
-# in the model cache, against its own no-movement baseline on the full val set.
+# the ETS ratio is fair). The model cache holds the landscape scored on the
+# whole cell instead, against its own no-movement baseline on that cell.
 # We use ETS instead of ARIMA because the landscape model's training target is
 # a heavily smoothed series (large rolling-mean window), which makes ARIMA
 # fits ill-conditioned (AR root → 1, recursive forecasts explode). Holt's
@@ -52,6 +62,15 @@ ETS_PAIR_COLS = {'horizon', 'ets_loss', 'ets_baseline_loss'}
 # trend slope just goes to zero. We guard the (rare) exactly-constant case
 # explicitly because statsmodels' MLE for SES diverges with zero variance.
 THETA_PAIR_COLS = {'horizon', 'theta_loss', 'theta_baseline_loss'}
+
+# (cache name, filename stem, required columns, loss column, baseline column).
+# One file per (cache, scenario) so a scenario can be recomputed on its own.
+CACHES = (
+    ('model', '', MODEL_PAIR_COLS, 'model_loss', 'baseline_loss'),
+    ('model_shared', '_model_shared', MODEL_PAIR_COLS, 'model_loss', 'baseline_loss'),
+    ('ets', '_ets', ETS_PAIR_COLS, 'ets_loss', 'ets_baseline_loss'),
+    ('theta', '_theta', THETA_PAIR_COLS, 'theta_loss', 'theta_baseline_loss'),
+)
 
 # Plot aggregator. Per-pair variants compute model_loss_i / baseline_loss_i
 # first, then aggregate; aggregate variants aggregate model_loss and baseline_loss
@@ -69,6 +88,20 @@ THETA_PAIR_COLS = {'horizon', 'theta_loss', 'theta_baseline_loss'}
 #   'absolute_median' = median(loss) per method in raw MSE units with Q1/Q3
 #                       IQR bars; baseline plotted separately as above.
 PLOT_AGGREGATOR = 'median_ratio'
+ABSOLUTE_AGGREGATORS = ('absolute_mean', 'absolute_median')
+# Which pairs the landscape is scored on. 'shared' is exactly the pairs ETS and
+# Theta could be fitted on, so every line in a panel comes from one pair set and
+# the comparison is a true head-to-head; 'full' is every pair in the cell, which
+# is the population estimate but not comparable to the baselines. Absolute mode
+# needs 'shared' for the three no-movement lines to coincide.
+LANDSCAPE_POOL = 'shared'
+LANDSCAPE_CACHE = 'model' if (LANDSCAPE_POOL == 'full'
+                              and PLOT_AGGREGATOR not in ABSOLUTE_AGGREGATORS) \
+    else 'model_shared'
+# The other landscape cache is neither computed nor plotted -- scoring a cell
+# twice costs a forward pass per pair for a number nothing reads.
+ACTIVE_CACHES = tuple(c for c in CACHES
+                      if c[0] in (LANDSCAPE_CACHE, 'ets', 'theta'))
 BOOTSTRAP_N = 1000
 BOOTSTRAP_SEED = 0
 BOOTSTRAP_CI_LO = 0.025
@@ -103,14 +136,48 @@ def _save_pair_cache(path, by_horizon):
     pl.concat(frames).write_parquet(path, compression='zstd')
 
 
-def _select_horizon_pairs(rolling_df, horizon_days, dim_cols,
-                          val_filter_values, cutoff_time, split_type, train_fraction,
-                          n_pairs, seed, tolerance_frac, dims,
-                          spec=None, scenario='val_out', split_key=None):
-    """Random sample of val pairs (with attached histories) for ts evaluation.
+def scenario_pairs(paired, spec, scenario, split_key):
+    """The pairs in one cell of the nested trajectory x time split.
 
-    Pulls from the same val pool the landscape model is evaluated on
-    (`build_horizon_pairs` + `apply_split`), then:
+    Not routed through `apply_split`/`cfg.split_type`: the landscape is fitted
+    on train_in of this split whatever split_type says, so anything else would
+    score it against a held-out set it was never held out from.
+    """
+    labelled = splits.label_pairs(paired, spec, time_col='future_createtime',
+                                  key=split_key)
+    traj, time = scenario.rsplit('_', 1)
+    cell = splits.select(labelled, traj, time)
+    splits.check_leakage(splits.training_rows(labelled), cell, scenario)
+    return cell
+
+
+def _store(cache, path, horizon, label, losses, baseline_losses,
+           loss_key, baseline_key):
+    """Log one horizon's per-pair losses and append them to the cache on disk."""
+    losses = np.asarray(losses, dtype=np.float64)
+    baseline_losses = np.asarray(baseline_losses, dtype=np.float64)
+    if len(losses) == 0:
+        print(f"  [{label}] no eligible pairs at {horizon}d, skipping.", flush=True)
+        return
+    mse = float(np.mean(losses))
+    base_mse = float(np.mean(baseline_losses))
+    ratio = mse / base_mse if base_mse > 0 else float('nan')
+    print(
+        f"  [{label}] n={len(losses)} mse={mse:.6f} baseline_mse={base_mse:.6f} "
+        f"ratio={ratio:.4f} frac_better={float(np.mean(losses < baseline_losses)):.3f}",
+        flush=True,
+    )
+    cache[horizon] = {loss_key: losses, baseline_key: baseline_losses}
+    _save_pair_cache(path, cache)
+
+
+def _select_horizon_pairs(rolling_df, horizon_days, dim_cols, spec, scenario,
+                          split_key, n_pairs, seed, tolerance_frac, dims):
+    """Random sample of a scenario's pairs (with attached histories) for ts
+    evaluation.
+
+    Pulls from the same pool the landscape model is evaluated on
+    (`build_horizon_pairs` + `scenario_pairs`), then:
       1. Joins each pair to its row index in the trajectory's rolling-mean
          series (so callers can slice history up to and including t0).
       2. Drops pairs whose history at t0 has fewer than `MIN_HISTORY` points.
@@ -121,17 +188,13 @@ def _select_horizon_pairs(rolling_df, horizon_days, dim_cols,
 
     Returns (pair_specs, traj_arrays).
     """
-    from nn_potential import build_horizon_pairs, apply_split
+    from nn_potential import build_horizon_pairs
 
     paired = build_horizon_pairs(rolling_df, horizon_days, dims, tolerance_frac)
     if len(paired) == 0:
         return [], {}
-    _, val_paired = apply_split(
-        paired, split_type, train_fraction,
-        val_filter_values=val_filter_values, cutoff_time=cutoff_time,
-        spec=spec, scenario=scenario, key=split_key,
-    )
-    if len(val_paired) == 0:
+    cell_paired = scenario_pairs(paired, spec, scenario, split_key)
+    if len(cell_paired) == 0:
         return [], {}
 
     # Global shift_n — same derivation as build_horizon_pairs, kept in sync so
@@ -146,22 +209,22 @@ def _select_horizon_pairs(rolling_df, horizon_days, dim_cols,
     rolling_with_idx = rolling_df.with_columns(
         pl.int_range(pl.len()).over('filter_value').alias('idx_t0')
     )
-    val_with_idx = val_paired.join(
+    cell_with_idx = cell_paired.join(
         rolling_with_idx.select(['filter_value', 'createtime', 'idx_t0']),
         on=['filter_value', 'createtime'], how='inner',
     ).filter(pl.col('idx_t0') >= MIN_HISTORY - 1)
 
-    n_avail = len(val_with_idx)
+    n_avail = len(cell_with_idx)
     if n_avail == 0:
         return [], {}
     if n_avail > n_pairs:
         rng = np.random.default_rng(seed)
         chosen_idx = np.sort(rng.choice(n_avail, size=n_pairs, replace=False))
-        val_with_idx = val_with_idx[chosen_idx]
+        cell_with_idx = cell_with_idx[chosen_idx]
 
     # Build per-trajectory value arrays only for trajectories that contributed
     # a sampled pair — keeps memory and traversal cost proportional to N.
-    used_fvs = set(val_with_idx['filter_value'].unique().to_list())
+    used_fvs = set(cell_with_idx['filter_value'].unique().to_list())
     traj_arrays = {}
     for grp_key, g in rolling_df.filter(pl.col('filter_value').is_in(list(used_fvs))) \
             .group_by('filter_value', maintain_order=True):
@@ -169,7 +232,7 @@ def _select_horizon_pairs(rolling_df, horizon_days, dim_cols,
         traj_arrays[fv] = g.select(dim_cols).to_numpy()
 
     pair_specs = []
-    for row in val_with_idx.iter_rows(named=True):
+    for row in cell_with_idx.iter_rows(named=True):
         fv = row['filter_value']
         idx = int(row['idx_t0'])
         x0 = np.asarray(row['x0'], dtype=np.float64)
@@ -277,9 +340,7 @@ def _evaluate_pairs_with_method(pair_specs, traj_arrays, n_dims, horizon_days,
     return np.array(method_losses), np.array(baseline_losses)
 
 
-def compute_ets_losses(rolling_df, horizon_days, dims,
-                       val_filter_values, cutoff_time, split_type, train_fraction,
-                       spec=None, scenario='val_out', split_key=None,
+def compute_ets_losses(rolling_df, horizon_days, dims, spec, scenario, split_key,
                        n_pairs=PAIRS_PER_HORIZON,
                        seed=ETS_SAMPLE_SEED,
                        tolerance_frac=0.25):
@@ -295,10 +356,8 @@ def compute_ets_losses(rolling_df, horizon_days, dims,
 
     dim_cols = [f'x0_{i}' for i in dims]
     pair_specs, traj_arrays = _select_horizon_pairs(
-        rolling_df, horizon_days, dim_cols,
-        val_filter_values, cutoff_time, split_type, train_fraction,
-        n_pairs, seed, tolerance_frac, dims, spec=spec, scenario=scenario,
-        split_key=split_key,
+        rolling_df, horizon_days, dim_cols, spec, scenario, split_key,
+        n_pairs, seed, tolerance_frac, dims,
     )
 
     def _fit_forecast(hist_d, shift_n):
@@ -317,9 +376,7 @@ def compute_ets_losses(rolling_df, horizon_days, dims,
     )
 
 
-def compute_theta_losses(rolling_df, horizon_days, dims,
-                         val_filter_values, cutoff_time, split_type, train_fraction,
-                         spec=None, scenario='val_out', split_key=None,
+def compute_theta_losses(rolling_df, horizon_days, dims, spec, scenario, split_key,
                          n_pairs=PAIRS_PER_HORIZON,
                          seed=ETS_SAMPLE_SEED,
                          tolerance_frac=0.25):
@@ -338,10 +395,8 @@ def compute_theta_losses(rolling_df, horizon_days, dims,
 
     dim_cols = [f'x0_{i}' for i in dims]
     pair_specs, traj_arrays = _select_horizon_pairs(
-        rolling_df, horizon_days, dim_cols,
-        val_filter_values, cutoff_time, split_type, train_fraction,
-        n_pairs, seed, tolerance_frac, dims, spec=spec, scenario=scenario,
-        split_key=split_key,
+        rolling_df, horizon_days, dim_cols, spec, scenario, split_key,
+        n_pairs, seed, tolerance_frac, dims,
     )
 
     def _fit_forecast(hist_d, shift_n):
@@ -372,27 +427,23 @@ def compute_theta_losses(rolling_df, horizon_days, dims,
     )
 
 
-def compute_landscape_shared_losses(rolling_df, horizon_days, dims,
-                                    val_filter_values, cutoff_time, split_type, train_fraction,
-                                    model, key, eval_batch_size,
-                                    spec=None, scenario='val_out', split_key=None,
+def compute_landscape_shared_losses(rolling_df, horizon_days, dims, spec, scenario,
+                                    split_key, model, key, eval_batch_size,
                                     n_pairs=PAIRS_PER_HORIZON,
                                     seed=ETS_SAMPLE_SEED,
                                     tolerance_frac=0.25):
     """Evaluate the landscape model on the same per-trajectory pair sample
-    used for ETS/Theta. `_select_horizon_pairs` is deterministic at seed=42
-    so the resulting set is identical to what's already cached for ETS/Theta —
-    this is the strict head-to-head population.
+    used for ETS/Theta in this scenario. `_select_horizon_pairs` is
+    deterministic at seed=42 so the resulting set is identical to what's
+    already cached for ETS/Theta — this is the strict head-to-head population.
     """
     from plnn.dataset import LandscapeSimulationDataset, NumpyLoader
     from nn_potential import df_to_data, evaluate_dataloader
 
     dim_cols = [f'x0_{i}' for i in dims]
     pair_specs, _ = _select_horizon_pairs(
-        rolling_df, horizon_days, dim_cols,
-        val_filter_values, cutoff_time, split_type, train_fraction,
-        n_pairs, seed, tolerance_frac, dims, spec=spec, scenario=scenario,
-        split_key=split_key,
+        rolling_df, horizon_days, dim_cols, spec, scenario, split_key,
+        n_pairs, seed, tolerance_frac, dims,
     )
     if len(pair_specs) == 0:
         return np.array([]), np.array([])
@@ -431,7 +482,7 @@ def main(cfg):
     from plnn.models import DeepTimePhiPLNN
 
     from nn_potential import df_to_data, rolling_frame, build_horizon_pairs, \
-        evaluate_dataloader, compute_training_split, apply_split, run_dir
+        evaluate_dataloader, run_dir
     from sweep_runs import state_path as select_state
 
     n_dims = cfg.n_dims
@@ -446,42 +497,22 @@ def main(cfg):
     fig_path = f'./figs/{trend_name}'
     os.makedirs(fig_path, exist_ok=True)
 
-    out_model = os.path.join(fig_path, 'nn_potential_horizon_skill.parquet.zstd')
-    out_model_shared = os.path.join(fig_path, 'nn_potential_horizon_skill_model_shared.parquet.zstd')
-    out_ets = os.path.join(fig_path, 'nn_potential_horizon_skill_ets.parquet.zstd')
-    out_theta = os.path.join(fig_path, 'nn_potential_horizon_skill_theta.parquet.zstd')
+    # One cache file per (method, scenario); cached[(method, scenario)] is
+    # {horizon: {loss column: per-pair array}}.
+    cache_path, cached = {}, {}
+    for name, stem, cols, _, _ in ACTIVE_CACHES:
+        for scenario, _, _ in SCENARIOS:
+            path = os.path.join(
+                fig_path, f'nn_potential_horizon_skill{stem}_{scenario}.parquet.zstd')
+            cache_path[(name, scenario)] = path
+            cached[(name, scenario)] = _load_pair_cache(path, cols)
 
-    model_by_horizon = _load_pair_cache(out_model, MODEL_PAIR_COLS)
-    model_shared_by_horizon = _load_pair_cache(out_model_shared, MODEL_PAIR_COLS)
-    ets_by_horizon = _load_pair_cache(out_ets, ETS_PAIR_COLS)
-    theta_by_horizon = _load_pair_cache(out_theta, THETA_PAIR_COLS)
-    print(
-        f"Cached: {len(model_by_horizon)} model (full-val) rows, "
-        f"{len(model_shared_by_horizon)} model (shared) rows, "
-        f"{len(ets_by_horizon)} ETS rows, "
-        f"{len(theta_by_horizon)} Theta rows",
-        flush=True,
-    )
+    todo = {k: [h for h in HORIZON_DAYS if h not in v] for k, v in cached.items()}
+    for (name, scenario), horizons in sorted(todo.items()):
+        if horizons:
+            print(f"Need {name} at {scenario} for {horizons}", flush=True)
 
-    horizons_needing_model = [h for h in HORIZON_DAYS if h not in model_by_horizon]
-    horizons_needing_model_shared = [h for h in HORIZON_DAYS if h not in model_shared_by_horizon]
-    horizons_needing_ets = [h for h in HORIZON_DAYS if h not in ets_by_horizon]
-    horizons_needing_theta = [h for h in HORIZON_DAYS if h not in theta_by_horizon]
-    horizons_needing_any = sorted(
-        set(horizons_needing_model)
-        | set(horizons_needing_model_shared)
-        | set(horizons_needing_ets)
-        | set(horizons_needing_theta)
-    )
-
-    if horizons_needing_any:
-        print(
-            f"Need model(full-val) for {horizons_needing_model}, "
-            f"model(shared) for {horizons_needing_model_shared}, "
-            f"ETS for {horizons_needing_ets}, "
-            f"Theta for {horizons_needing_theta}",
-            flush=True,
-        )
+    if any(todo.values()):
         print("Loading data...", flush=True)
         target_df, _, _ = latent_space.load(cfg, smooth=False)
         target_df = target_df.rename({latent_space.COORD: 'x0'})
@@ -500,17 +531,17 @@ def main(cfg):
         rolling_df = rolling_frame(cfg, target_df, dims)
         print(f"Timestep rows: {len(rolling_df)}", flush=True)
 
-        # Recover the same train/val split metadata used during training
-        val_filter_values, cutoff_time = compute_training_split(cfg)
+        # The same nested split the trainer labelled its pairs with, so the
+        # scenario cells here are the ones the model was held out from.
         spec = splits.SplitSpec.from_cfg(cfg)
         split_key = latent_space.split_key(cfg)
 
-        # Lazily load the landscape model only if some horizon needs model
-        # results. ETS shares rolling_df so it predicts the same smoothed
+        # Lazily load the landscape model only if some cell needs model
+        # results. ETS/Theta share rolling_df so they predict the same smoothed
         # target as the landscape model.
         model = None
         key = None
-        if horizons_needing_model or horizons_needing_model_shared:
+        if any(todo[(LANDSCAPE_CACHE, s)] for s, _, _ in SCENARIOS):
             dtype = jnp.float32
             state_path = select_state(dir_path)
             print(f"Loading model from: {state_path}", flush=True)
@@ -520,161 +551,72 @@ def main(cfg):
             rng = np.random.default_rng(seed=seed)
             key = jax.random.PRNGKey(int(rng.integers(2**32)))
 
-        for horizon in horizons_needing_any:
-            print(f"\n--- Horizon: {horizon}d ---", flush=True)
+        for scenario, title, subtitle in SCENARIOS:
+            horizons_needed = sorted(
+                {h for name, _, _, _, _ in ACTIVE_CACHES for h in todo[(name, scenario)]})
+            if not horizons_needed:
+                continue
+            print(f"\n=== {scenario}: {title} ({subtitle}) ===", flush=True)
 
-            if horizon not in model_by_horizon:
-                paired_df = build_horizon_pairs(rolling_df, horizon, dims)
-                print(f"  Paired samples: {len(paired_df)}", flush=True)
-                if len(paired_df) == 0:
-                    print(f"  No pairs at {horizon}d for landscape model.", flush=True)
-                else:
-                    _, val_df = apply_split(
-                        paired_df, cfg.split_type, cfg.train_fraction,
-                        val_filter_values=val_filter_values, cutoff_time=cutoff_time,
-                        spec=spec, scenario=cfg.objective_scenario, key=split_key,
-                    )
-                    print(f"  Val samples: {len(val_df)}", flush=True)
-                    if len(val_df) == 0:
-                        print(f"  No val pairs at {horizon}d for landscape model.", flush=True)
+            for horizon in horizons_needed:
+                print(f"\n--- {scenario} @ {horizon}d ---", flush=True)
+
+                if horizon in todo[(LANDSCAPE_CACHE, scenario)]:
+                    key, subkey = jax.random.split(key)
+                    if LANDSCAPE_CACHE == 'model_shared':
+                        losses, baselines = compute_landscape_shared_losses(
+                            rolling_df, horizon, dims, spec, scenario, split_key,
+                            model, subkey, cfg.eval_batch_size)
                     else:
-                        val_data = df_to_data(val_df)
-                        val_dataset = LandscapeSimulationDataset(data=val_data)
-                        val_dataloader = NumpyLoader(
-                            val_dataset,
-                            batch_size=min(cfg.eval_batch_size, len(val_dataset)),
-                            shuffle=False,
-                        )
+                        paired_df = build_horizon_pairs(rolling_df, horizon, dims)
+                        cell_df = scenario_pairs(paired_df, spec, scenario, split_key) \
+                            if len(paired_df) else paired_df
+                        print(f"  Pairs: {len(paired_df)} total, "
+                              f"{len(cell_df)} in {scenario}", flush=True)
+                        losses, baselines = np.array([]), np.array([])
+                        if len(cell_df):
+                            dataloader = NumpyLoader(
+                                LandscapeSimulationDataset(data=df_to_data(cell_df)),
+                                batch_size=min(cfg.eval_batch_size, len(cell_df)),
+                                shuffle=False,
+                            )
+                            losses, baselines = evaluate_dataloader(
+                                model, dataloader, subkey)
+                    _store(cached[(LANDSCAPE_CACHE, scenario)],
+                           cache_path[(LANDSCAPE_CACHE, scenario)],
+                           horizon, LANDSCAPE_CACHE, losses, baselines,
+                           'model_loss', 'baseline_loss')
 
-                        key, subkey = jax.random.split(key)
-                        model_losses, baseline_losses = evaluate_dataloader(model, val_dataloader, subkey)
-
-                        model_losses = np.asarray(model_losses, dtype=np.float64)
-                        baseline_losses = np.asarray(baseline_losses, dtype=np.float64)
-                        model_mse = float(np.mean(model_losses))
-                        baseline_mse = float(np.mean(baseline_losses))
-                        ratio = model_mse / baseline_mse if baseline_mse > 0 else float('nan')
-                        frac_better = float(np.mean(model_losses < baseline_losses))
-                        print(
-                            f"  [model] n={len(model_losses)} model_mse={model_mse:.6f} "
-                            f"baseline_mse={baseline_mse:.6f} ratio={ratio:.4f} "
-                            f"frac_better={frac_better:.3f}",
-                            flush=True,
-                        )
-
-                        model_by_horizon[horizon] = {
-                            'model_loss': model_losses,
-                            'baseline_loss': baseline_losses,
-                        }
-                        _save_pair_cache(out_model, model_by_horizon)
-
-            if horizon not in model_shared_by_horizon:
-                key, subkey = jax.random.split(key)
-                ms_losses, ms_baseline_losses = compute_landscape_shared_losses(
-                    rolling_df, horizon, dims,
-                    val_filter_values, cutoff_time, cfg.split_type, cfg.train_fraction,
-                    model, subkey, cfg.eval_batch_size,
-                    spec=spec, scenario=cfg.objective_scenario,
-                    split_key=split_key,
-                )
-                if len(ms_losses) == 0:
-                    print(f"  [model_shared] no eligible pairs at {horizon}d, skipping.", flush=True)
-                else:
-                    ms_mse = float(np.mean(ms_losses))
-                    ms_baseline_mse = float(np.mean(ms_baseline_losses))
-                    ms_ratio = ms_mse / ms_baseline_mse \
-                        if ms_baseline_mse > 0 else float('nan')
-                    ms_frac_better = float(np.mean(ms_losses < ms_baseline_losses))
-                    print(
-                        f"  [model_shared] n={len(ms_losses)} mse={ms_mse:.6f} "
-                        f"baseline_mse={ms_baseline_mse:.6f} ratio={ms_ratio:.4f} "
-                        f"frac_better={ms_frac_better:.3f}",
-                        flush=True,
-                    )
-                    model_shared_by_horizon[horizon] = {
-                        'model_loss': ms_losses,
-                        'baseline_loss': ms_baseline_losses,
-                    }
-                    _save_pair_cache(out_model_shared, model_shared_by_horizon)
-
-            if horizon not in ets_by_horizon:
-                ets_losses, ets_baseline_losses = compute_ets_losses(
-                    rolling_df, horizon, dims,
-                    val_filter_values, cutoff_time, cfg.split_type, cfg.train_fraction,
-                    spec=spec, scenario=cfg.objective_scenario,
-                    split_key=split_key,
-                )
-                if len(ets_losses) == 0:
-                    print(f"  [ets] no eligible pairs at {horizon}d, skipping ETS.", flush=True)
-                else:
-                    ets_losses = ets_losses.astype(np.float64)
-                    ets_baseline_losses = ets_baseline_losses.astype(np.float64)
-                    ets_mse = float(np.mean(ets_losses))
-                    ets_baseline_mse = float(np.mean(ets_baseline_losses))
-                    ets_ratio = ets_mse / ets_baseline_mse \
-                        if ets_baseline_mse > 0 else float('nan')
-                    ets_frac_better = float(np.mean(ets_losses < ets_baseline_losses))
-
-                    print(
-                        f"  [ets] ets_n={len(ets_losses)} ets_mse={ets_mse:.6f} "
-                        f"ets_baseline_mse={ets_baseline_mse:.6f} "
-                        f"ets_ratio={ets_ratio:.4f} "
-                        f"ets_frac_better={ets_frac_better:.3f}",
-                        flush=True,
+                if horizon in todo[('ets', scenario)]:
+                    _store(
+                        cached[('ets', scenario)], cache_path[('ets', scenario)],
+                        horizon, 'ets',
+                        *compute_ets_losses(
+                            rolling_df, horizon, dims, spec, scenario, split_key),
+                        loss_key='ets_loss', baseline_key='ets_baseline_loss',
                     )
 
-                    ets_by_horizon[horizon] = {
-                        'ets_loss': ets_losses,
-                        'ets_baseline_loss': ets_baseline_losses,
-                    }
-                    _save_pair_cache(out_ets, ets_by_horizon)
-
-            if horizon not in theta_by_horizon:
-                theta_losses, theta_baseline_losses = compute_theta_losses(
-                    rolling_df, horizon, dims,
-                    val_filter_values, cutoff_time, cfg.split_type, cfg.train_fraction,
-                    spec=spec, scenario=cfg.objective_scenario,
-                    split_key=split_key,
-                )
-                if len(theta_losses) == 0:
-                    print(f"  [theta] no eligible pairs at {horizon}d, skipping Theta.", flush=True)
-                else:
-                    theta_losses = theta_losses.astype(np.float64)
-                    theta_baseline_losses = theta_baseline_losses.astype(np.float64)
-                    theta_mse = float(np.mean(theta_losses))
-                    theta_baseline_mse = float(np.mean(theta_baseline_losses))
-                    theta_ratio = theta_mse / theta_baseline_mse \
-                        if theta_baseline_mse > 0 else float('nan')
-                    theta_frac_better = float(np.mean(theta_losses < theta_baseline_losses))
-
-                    print(
-                        f"  [theta] theta_n={len(theta_losses)} theta_mse={theta_mse:.6f} "
-                        f"theta_baseline_mse={theta_baseline_mse:.6f} "
-                        f"theta_ratio={theta_ratio:.4f} "
-                        f"theta_frac_better={theta_frac_better:.3f}",
-                        flush=True,
+                if horizon in todo[('theta', scenario)]:
+                    _store(
+                        cached[('theta', scenario)], cache_path[('theta', scenario)],
+                        horizon, 'theta',
+                        *compute_theta_losses(
+                            rolling_df, horizon, dims, spec, scenario, split_key),
+                        loss_key='theta_loss', baseline_key='theta_baseline_loss',
                     )
-
-                    theta_by_horizon[horizon] = {
-                        'theta_loss': theta_losses,
-                        'theta_baseline_loss': theta_baseline_losses,
-                    }
-                    _save_pair_cache(out_theta, theta_by_horizon)
     else:
-        print("All horizons cached for all methods; skipping computation.", flush=True)
+        print("All horizons cached for every method and scenario; skipping computation.",
+              flush=True)
 
-    if not model_by_horizon and not ets_by_horizon and not theta_by_horizon:
+    if not any(cached.values()):
         print("No horizons produced results; nothing to plot.", flush=True)
         return
 
-    # Each method is normalised by its own no-movement baseline so y=1 means
-    # "no-movement" for every line. The landscape line uses the full val-set
-    # pairs (`model_by_horizon`); ETS/Theta use the per-trajectory subsample
-    # from `_select_horizon_pairs`. Median of per-pair ratios with Q1–Q3 error
-    # bars — robust to the heavy right tail of squared errors. The shared-pool
-    # landscape cache (`model_shared_by_horizon`) is kept on disk for the
-    # strict head-to-head answer but not plotted here.
-    fig, ax = plt.subplots(1, 1, figsize=(5.5, 3))
+    # One panel per scenario, each normalised by its own no-movement baseline
+    # so y=1 means "no-movement" everywhere. Median of per-pair ratios with
+    # Q1-Q3 error bars — robust to the heavy right tail of squared errors.
+    fig, axes = plt.subplots(1, len(SCENARIOS), figsize=(4.1 * len(SCENARIOS), 3.3),
+                             sharey=True)
 
     def _median_iqr(by_horizon, loss_key, baseline_key):
         # Per-pair ratio model_loss_i / baseline_loss_i, then median + IQR. An
@@ -834,7 +776,7 @@ def main(cfg):
         return hs, points, yerr
 
     ci_pct = int(round((BOOTSTRAP_CI_HI - BOOTSTRAP_CI_LO) * 100))
-    absolute_mode = PLOT_AGGREGATOR in ('absolute_mean', 'absolute_median')
+    absolute_mode = PLOT_AGGREGATOR in ABSOLUTE_AGGREGATORS
     if PLOT_AGGREGATOR == 'median_per_pair':
         _aggregate = _median_iqr
         ylabel = 'Per-pair loss / No-movement loss (median, IQR)'
@@ -856,68 +798,93 @@ def main(cfg):
     else:
         raise ValueError(f"Unknown PLOT_AGGREGATOR: {PLOT_AGGREGATOR}")
 
-    # In absolute mode use the head-to-head model_shared cache so all methods
-    # share the same baseline pair set; model_shared/ETS/theta baselines are
-    # bit-identical by construction (deterministic seed=42 pair selection).
-    plot_model_cache = model_shared_by_horizon if absolute_mode else model_by_horizon
-    if plot_model_cache:
-        h_model, med_model, err_model = _aggregate(
-            plot_model_cache, 'model_loss', 'baseline_loss')
-        ax.errorbar(h_model, med_model, yerr=err_model,
-                    fmt='o-', capsize=3, label='Potential landscape')
-    if ets_by_horizon:
-        h_ets, med_ets, err_ets = _aggregate(
-            ets_by_horizon, 'ets_loss', 'ets_baseline_loss')
-        ax.errorbar(h_ets, med_ets, yerr=err_ets,
-                    fmt='s--', capsize=3, label='Holt damped trend')
-    if theta_by_horizon:
-        h_theta, med_theta, err_theta = _aggregate(
-            theta_by_horizon, 'theta_loss', 'theta_baseline_loss')
-        ax.errorbar(h_theta, med_theta, yerr=err_theta,
-                    fmt='^-.', capsize=3, label='Damped Theta')
-    if absolute_mode:
-        baseline_cache = ets_by_horizon or theta_by_horizon or model_shared_by_horizon
-        baseline_key = 'ets_baseline_loss' if ets_by_horizon \
-            else ('theta_baseline_loss' if theta_by_horizon else 'baseline_loss')
-        if baseline_cache:
-            h_b, med_b, err_b = _aggregate(baseline_cache, baseline_key, None)
-            ax.errorbar(h_b, med_b, yerr=err_b,
-                        fmt='D:', capsize=3, color='k', label='No-movement')
-        ax.set_yscale('log')
-    else:
-        ax.axhline(1.0, color='k', linestyle=':', linewidth=1, label='No-movement')
-        ax.set_ylim(top=1.5)
-    ax.set_xscale('log')
-    ax.set_xlabel('Prediction horizon (days)')
-    ax.set_ylabel(ylabel)
-    ax.legend(fontsize=8, loc='lower right')
-    ax.grid(True, which='both', alpha=0.3)
+    from scipy import stats
 
-    fig.tight_layout()
+    for ax, (scenario, title, subtitle) in zip(np.atleast_1d(axes), SCENARIOS):
+        model_cache = cached[(LANDSCAPE_CACHE, scenario)]
+        ets_cache = cached[('ets', scenario)]
+        theta_cache = cached[('theta', scenario)]
+
+        h_model = med_model = None
+        if model_cache:
+            h_model, med_model, err_model = _aggregate(
+                model_cache, 'model_loss', 'baseline_loss')
+            ax.errorbar(h_model, med_model, yerr=err_model,
+                        fmt='o-', capsize=3, label='Potential landscape')
+        if ets_cache:
+            h_ets, med_ets, err_ets = _aggregate(
+                ets_cache, 'ets_loss', 'ets_baseline_loss')
+            ax.errorbar(h_ets, med_ets, yerr=err_ets,
+                        fmt='s--', capsize=3, label='Holt damped trend')
+        if theta_cache:
+            h_theta, med_theta, err_theta = _aggregate(
+                theta_cache, 'theta_loss', 'theta_baseline_loss')
+            ax.errorbar(h_theta, med_theta, yerr=err_theta,
+                        fmt='^-.', capsize=3, label='Damped Theta')
+
+        if absolute_mode:
+            # model_shared/ETS/theta baselines are bit-identical by
+            # construction (deterministic seed=42 pair selection), so any of
+            # them draws the same no-movement line.
+            baseline_cache = ets_cache or theta_cache or model_cache
+            baseline_key = 'ets_baseline_loss' if ets_cache \
+                else ('theta_baseline_loss' if theta_cache else 'baseline_loss')
+            if baseline_cache:
+                h_b, med_b, err_b = _aggregate(baseline_cache, baseline_key, None)
+                ax.errorbar(h_b, med_b, yerr=err_b,
+                            fmt='D:', capsize=3, color='k', label='No-movement')
+            ax.set_yscale('log')
+        else:
+            ax.axhline(1.0, color='k', linestyle=':', linewidth=1, label='No-movement')
+            ax.set_ylim(top=1.5)
+        ax.set_xscale('log')
+        ax.set_xlabel('Prediction horizon (days)')
+        ax.set_title(f'{title}\n({subtitle})', fontsize=9)
+        ax.grid(True, which='both', alpha=0.3)
+
+        if med_model is None or not np.any(np.isfinite(med_model)):
+            print(f"{scenario}: no landscape results to summarise.", flush=True)
+            continue
+        best_horizon = h_model[int(np.nanargmin(med_model))]
+        print(
+            f"{scenario} ({title}): maximum improvement over baseline of "
+            f"{1.0 - np.nanmin(med_model):.2%} at {best_horizon}d",
+            flush=True,
+        )
+
+        # Paired one-sided Wilcoxon signed-rank test at the best horizon: H1 is
+        # that model_loss < baseline_loss per pair. Non-parametric because the
+        # squared-error distribution is heavily right-tailed.
+        best_losses = np.asarray(
+            model_cache[best_horizon]['model_loss'], dtype=np.float64)
+        best_baseline = np.asarray(
+            model_cache[best_horizon]['baseline_loss'], dtype=np.float64)
+        wilcoxon_res = stats.wilcoxon(best_losses, best_baseline, alternative='less')
+        print(
+            f"  Wilcoxon signed-rank (model < baseline) at {best_horizon}d: "
+            f"n={len(best_losses)} statistic={wilcoxon_res.statistic:.3g} "
+            f"p={wilcoxon_res.pvalue:.3g} "
+            f"median(model-baseline)={float(np.median(best_losses - best_baseline)):.6g} "
+            f"frac_better={float(np.mean(best_losses < best_baseline)):.3f}",
+            flush=True,
+        )
+
+    axes_list = list(np.atleast_1d(axes))
+    axes_list[0].set_ylabel(ylabel)
+
+    # One legend under all three panels: in-axes it lands on the curves, which
+    # converge on the no-movement line at the right of every panel. Matplotlib
+    # returns the axhline (a Line2D) ahead of the errorbar containers, so the
+    # no-movement reference is moved to the end rather than leading the legend.
+    handles, labels = axes_list[0].get_legend_handles_labels()
+    order = sorted(range(len(labels)), key=lambda i: labels[i] == 'No-movement')
+    fig.legend([handles[i] for i in order], [labels[i] for i in order],
+               fontsize=8, ncol=len(labels), loc='lower center', frameon=False)
+
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
     fig_file = os.path.join(fig_path, 'nn_potential_horizon_skill.png')
     fig.savefig(fig_file, dpi=150, bbox_inches='tight')
     print(f"Saved figure to {fig_file}", flush=True)
-
-    best_idx = int(np.nanargmin(med_model))
-    best_horizon = h_model[best_idx]
-    print(f"Maximum improvement over baseline of {1.0 - np.nanmin(med_model):.2%} at {best_horizon}d", flush=True)
-
-    # Paired one-sided Wilcoxon signed-rank test at the best horizon: H1 is that
-    # model_loss < baseline_loss per pair. Non-parametric because the squared-
-    # error distribution is heavily right-tailed.
-    from scipy import stats
-    best_losses = np.asarray(plot_model_cache[best_horizon]['model_loss'], dtype=np.float64)
-    best_baseline = np.asarray(plot_model_cache[best_horizon]['baseline_loss'], dtype=np.float64)
-    wilcoxon_res = stats.wilcoxon(best_losses, best_baseline, alternative='less')
-    median_diff = float(np.median(best_losses - best_baseline))
-    frac_better = float(np.mean(best_losses < best_baseline))
-    print(
-        f"Wilcoxon signed-rank (model < baseline) at {best_horizon}d: "
-        f"n={len(best_losses)} statistic={wilcoxon_res.statistic:.3g} "
-        f"p={wilcoxon_res.pvalue:.3g} median(model-baseline)={median_diff:.6g} "
-        f"frac_better={frac_better:.3f}",
-        flush=True,
-    )
 
 
 if __name__ == '__main__':
