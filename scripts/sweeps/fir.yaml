@@ -86,6 +86,14 @@ parameters:
   solver:
     value: euler
 
+  # Every trial is fitted and scored on this one population. The posterior-sd
+  # rule it replaces keys off the fast block, so n_fast and n_dims chose the
+  # seeds a trial was graded on, and the objective tracked that choice more
+  # closely than it tracked any modelling axis. Written by
+  # scripts/flows/pin_seeds.py.
+  latents.seed_path:
+    value: tmp/eval_seeds.parquet.zstd
+
   # Rows between bin centres are forecast forward from the last one under
   # causal_state, so they carry no observation of their own. Resampling would
   # make seven of every eight one-step displacements the prior's decay.
