@@ -844,6 +844,12 @@ def main(cfg):
         for platform in PLATFORMS:
             platform_cfg = omegaconf.OmegaConf.merge(cfg, {'platform': platform})
             platform_state_path = sweep_runs.state_path(run_dir(platform_cfg))
+            if platform_state_path is None:
+                raise SystemExit(
+                    f'no {platform} landscape under {run_dir(platform_cfg)}. '
+                    'platform_snapshots needs one model per platform, each '
+                    'trained by nn_potential.py with platform=<name> and the '
+                    "rest of this run's overrides.")
             platform_models[platform], _ = DeepTimePhiPLNN.load(platform_state_path, dtype=dtype)
 
             platform_dfs[platform] = latent_space.keep_platform(platform_cfg, target_df)
