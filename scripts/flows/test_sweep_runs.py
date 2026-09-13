@@ -50,6 +50,16 @@ def test_overrides_cover_every_key_that_determines_the_directory():
                    sweep_runs.overrides({'config': cfg}))
 
 
+def test_overrides_pin_a_latents_key_that_does_not_key_the_directory():
+    """seed_path names the trajectories a trial was scored on and keys nothing,
+    so config.yaml must not get to answer it."""
+    cfg = {'latents': {'method': 'gpfa', 'seed_path': 'tmp/eval_seeds.parquet.zstd',
+                       'rank_by_volume': True}}
+    emitted = dict(o.split('=', 1) for o in sweep_runs.overrides({'config': cfg}))
+    assert emitted['latents.seed_path'] == "'tmp/eval_seeds.parquet.zstd'"
+    assert emitted['latents.rank_by_volume'] == 'true'
+
+
 def test_the_scored_checkpoint_wins_over_a_newer_epoch_file(tmp_path):
     d = write_run(tmp_path, 'a', 0.1, {}, states=(), best=True)
     later = d / 'states' / 'model_42.pth'

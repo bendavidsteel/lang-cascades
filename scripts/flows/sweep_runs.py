@@ -147,14 +147,21 @@ def find(out_root, run_id=None, sweep_id=None, where=(), require_state=True,
 
 
 def overrides(record):
-    """Hydra overrides that reproduce this run's directory.
+    """Hydra overrides that reproduce this run's directory, and the data under it.
 
     A key the record does not carry is skipped: it predates that key, and
     LatentConfig defaults it the same way the trial did.
+
+    Every `latents` key the record carries is emitted, not only the ones that
+    key the fit. seed_path is the reason: it names the trajectories a trial was
+    fitted and scored on without changing any tag, so left to config.yaml it
+    silently hands the eval and the figures a different population.
     """
     cfg = record.get('config') or {}
+    paths = _cfg_paths()
+    paths += [f'latents.{k}' for k in (cfg.get('latents') or {})]
     out = []
-    for path in _cfg_paths():
+    for path in dict.fromkeys(paths):
         value = _get(cfg, path)
         if value is KeyError:
             continue
