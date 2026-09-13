@@ -11,6 +11,12 @@ aggregate, the split, and the landscape fields. Anything else a trial set is
 left at the local default on purpose, so a stale key in config.yaml cannot
 silently point the lookup at a different directory.
 
+Only trials of the current era are offered: a prior that does not revert, on
+the filtered state, trained after the fixes to the training loop. Nothing in a
+record separates a fixed run from a broken one, so that last cut is by when the
+trial finished. --where overrides any one field of the era and --any-era drops
+it entirely.
+
     python scripts/flows/sweep_runs.py --best --where num_epochs=100
     python scripts/flows/sweep_runs.py --run-id yya9bnc2 --format shell
 """
@@ -27,6 +33,20 @@ from latent_gp.latents import LatentConfig
 BEST_STATE = 'model_best.pth'
 
 RECORD = 'run.json'
+
+# What a model has to be to stand behind a number in the paper: a prior that
+# does not mean-revert, since the objective scores against a momentum rule that
+# cannot predict reversion, and the filtered state, since a forecast cannot read
+# observations after the origin.
+ERA_WHERE = (('latents.fast_kind', 'wiener'),
+             ('latents.slow_kind', 'const|wiener'),
+             ('latents.causal_state', 'true'))
+
+# Trials that finished before this predate the fixes to the training loop, and
+# their objective is not comparable with a later one. A config value cannot tell
+# them apart -- the fixes were to the code -- so the cut is the first sweep to
+# run with them in place.
+ERA_START = '2026-09-13T10:00:00'
 
 # cfg paths for the LatentConfig fields that are not under `latents`
 TOP_LEVEL = {'n_dims': 'n_dims', 'min_target_volume': 'min_target_volume'}
@@ -97,12 +117,14 @@ def has_state(run_path):
     return os.path.isdir(states) and bool(os.listdir(states))
 
 
-def find(out_root, run_id=None, sweep_id=None, where=(), require_state=True):
+def find(out_root, run_id=None, sweep_id=None, where=(), require_state=True,
+         since=None):
     """Matching records, best objective first.
 
     `where` is (dotted config path, string value) pairs, compared against the
     recorded config rendered the same way the overrides are, so that a filter
-    reads like the override it would produce.
+    reads like the override it would produce. A value may offer alternatives,
+    `const|wiener`. `since` drops anything that finished before it.
     """
     out = []
     for run_path, rec in records(out_root):
@@ -112,8 +134,10 @@ def find(out_root, run_id=None, sweep_id=None, where=(), require_state=True):
             continue
         if require_state and not has_state(run_path):
             continue
+        if since and (rec.get('finished') or '') < since:
+            continue
         cfg = rec.get('config') or {}
-        if any(_fmt(_get(cfg, k)) != v for k, v in where):
+        if any(_fmt(_get(cfg, k)) not in v.split('|') for k, v in where):
             continue
         out.append((run_path, rec))
     # an unscored trial sorts last rather than raising
@@ -166,7 +190,12 @@ def main():
     ap.add_argument('--run-id', help='wandb run id')
     ap.add_argument('--sweep-id', help='wandb sweep id')
     ap.add_argument('--where', action='append', default=[], metavar='PATH=VALUE',
-                    help='require a recorded config value, e.g. num_epochs=100')
+                    help='require a recorded config value, e.g. num_epochs=100; '
+                         'alternatives as slow_kind=const|wiener. Overrides the '
+                         'era default for that path.')
+    ap.add_argument('--any-era', action='store_true',
+                    help='also offer trials that predate the training fixes, '
+                         'or that revert, or that read the smoothed state')
     ap.add_argument('--best', action='store_true',
                     help='emit only the highest-objective match')
     ap.add_argument('--any-state', action='store_true',
@@ -177,17 +206,20 @@ def main():
                     help='array name for --format shell')
     args = ap.parse_args()
 
-    where = []
+    where = {} if args.any_era else dict(ERA_WHERE)
     for w in args.where:
         if '=' not in w:
             ap.error(f'--where needs PATH=VALUE, got {w!r}')
         k, v = w.split('=', 1)
-        where.append((k, v))
+        where[k] = v
 
     hits = find(args.out_root, run_id=args.run_id, sweep_id=args.sweep_id,
-                where=where, require_state=not args.any_state)
+                where=where.items(), require_state=not args.any_state,
+                since=None if args.any_era else ERA_START)
     if not hits:
-        raise SystemExit('no run record matched')
+        raise SystemExit('no run record matched'
+                         + ('' if args.any_era else '; --any-era to look past '
+                            f'the era beginning {ERA_START}'))
     if args.best or args.format != 'table':
         hits = hits[:1]
 
@@ -208,7 +240,7 @@ def main():
         return
 
     print(f'# {rec.get("run_id")} of sweep {rec.get("sweep_id")}, '
-          f'objective {rec.get("objective")}')
+          f'objective {rec.get("objective")}, finished {rec.get("finished")}')
     print(f'# model: {state_path(run_path)}')
     print(f'{args.name}=(')
     for o in ovr:
