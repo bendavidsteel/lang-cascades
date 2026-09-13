@@ -1,8 +1,7 @@
 # Sweep for Fir, where a job is two hours on one H100.
 #
 # Same search as joint.yaml, restricted to the configurations that finish well
-# inside a two-hour allocation, and to a prior that does not mean-revert --
-# see latents.fast_kind below. joint.yaml keeps the reverting kinds.
+# inside a two-hour allocation.
 #
 # The runtime restriction is not a compromise about what is worth
 # exploring: runtime on these trials is driven entirely by the
@@ -154,14 +153,12 @@ parameters:
   # weighting but collapses onto the pooled value when only one axis moves, so
   # read spurious_drift_ratio and baseline_mse beside both.
   #
-  # Fixed at wiener here, and this arm is the reason. A reverting prior writes
-  # its own reversion into the state between observations, and a linear field
-  # fitted to the 90-day displacements picks that up: swapping ou for wiener
-  # takes the smoothed column from R2 0.36 to 0.08. Since momentum cannot
-  # predict reversion, a landscape that learns nothing but the prior still
-  # beats the baseline, so ou's lead on the objective is not yet evidence of
-  # anything. Neither is the slow block, which is why it drops its ou too.
-  # Prometheus runs the paired ou/wiener check that settles it.
+  # Fixed at wiener. A reverting prior writes its own reversion into the state
+  # between observations, and the objective scores against a momentum rule that
+  # cannot predict reversion, so a landscape that learns nothing but the prior
+  # still beats the baseline. Given ou the search took it: the top ten trials
+  # of one sweep all paired it with the fastest tau and a single drifting
+  # dimension, for drift fields 96-99% reproduced by one linear map.
   #
   # n_fast=6 is >= every n_dims offered, which is how a homogeneous mix is
   # reached: the winning prior was homogeneous, and a per-dimension mix cannot

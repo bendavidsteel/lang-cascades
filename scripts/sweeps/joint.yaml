@@ -159,11 +159,13 @@ parameters:
   # weighting but collapses onto the pooled value when only one axis moves, so
   # read spurious_drift_ratio and baseline_mse beside both.
   #
-  # fast_kind decides whether a drifting dimension is confined. Both kinds are
-  # rough and their tau means the same thing, so the pair isolates confinement.
-  # On the GPFA's own held-out blocks a homogeneous OU at tau=80 took the best
-  # forecast RPS and log score of nine priors tried, beating the Wiener at every
-  # matched tau, so it is on the menu here rather than assumed.
+  # Fixed at wiener. A confined prior reverts, and the objective scores against
+  # a momentum rule that cannot predict reversion, so a landscape that learns
+  # nothing but the prior's decay still beats the baseline. Given the choice
+  # the search took it: every one of the top ten trials paired ou with the
+  # fastest tau and a single drifting dimension, and their drift fields were
+  # 96-99% one linear map. A stance that reverts to a fixed point is also the
+  # less likely claim about the process.
   #
   # n_fast=6 is >= every n_dims offered, which is how a homogeneous mix is
   # reached: the winning prior was homogeneous, and a per-dimension mix cannot
@@ -173,18 +175,17 @@ parameters:
   latents.n_fast:
     values: [1, 2, 3, 4, 6]
   latents.fast_kind:
-    values: [wiener, ou]
+    value: wiener
   latents.fast_tau:
     values: [10.0, 20.0, 40.0, 80.0]
-  # Confining the slow dimensions turned out to matter more than whether they
-  # drift at all: holding a 1fast+5slow mix fixed and changing only the slow
-  # kind, const -> wiener -> ou took forecast RPS 0.2830 -> 0.2822 -> 0.2734.
+  # Whether the slow block drifts at all, against the same objection that fixed
+  # fast_kind: a confining slow prior reverts, and reversion is what the
+  # momentum baseline cannot see. const and wiener both leave the slow
+  # dimensions unconfined, so neither can pay the landscape for the prior.
   #
-  # slow_tau has to come with it. An OU reverts over 2*tau, so at 2560 alone it
-  # would not revert once inside the span of the data and the option would be a
-  # null test; 640 is where the gain above was measured.
+  # slow_tau is only read by wiener, where it sets the diffusion scale.
   latents.slow_kind:
-    values: [const, wiener, ou]
+    values: [const, wiener]
   latents.slow_tau:
     values: [640.0, 2560.0]
   # Fixed, not swept. The grid spacing is 2 * bin_factor days and the fast
