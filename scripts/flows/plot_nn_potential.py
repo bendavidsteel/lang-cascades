@@ -728,6 +728,8 @@ def main(cfg):
         end_date = end_date.date()
     trange = ( (start_date - INITIAL_DATE.date()).days / UNIT_DAYS, (end_date - INITIAL_DATE.date()).days / UNIT_DAYS )
 
+    axis_prefix = latent_space.axis_prefix(cfg)
+
     plot_kwargs = {
         'mc_dropout': cfg.mc_dropout,
         'key': modelkey,
@@ -743,7 +745,7 @@ def main(cfg):
         'n_marginal': 256,
         'n_dims': cfg.n_dims,
         'target_weights': target_weights,
-        'axis_prefix': latent_space.axis_prefix(cfg),
+        'axis_prefix': axis_prefix,
     }
 
     PLATFORMS = ['twitter', 'tiktok', 'instagram', 'bluesky']
