@@ -5,8 +5,8 @@ actor type, for non-politicians), and within each stratum spreads the draw over
 as many distinct accounts (influencers, politicians) as possible.
 
 The output file gives, per post, a URL that opens the post in a browser, plus a
-random sample of the post's extracted stance targets and the stance
-classification of each of those targets.
+random sample of the post's extracted stance targets, the stance classification
+of each of those targets, and the classifier's probability for each class.
 
 Pass --include with an earlier sample (or the coded CSV exported by the coding
 page) to grow a sample rather than redraw one: every pair already in that file is
@@ -32,6 +32,13 @@ import polars as pl
 
 STANCE_FILE_RE = re.compile(r'^(\d{4})_(\d{1,2})_doc_targets_with_stance\.parquet\.zstd$')
 
+STANCE_FILE_SUFFIX = '_doc_targets_with_stance.parquet.zstd'
+PROBS_FILE_SUFFIX = '_doc_targets_stance_probs.parquet.zstd'
+
+# the classification head's class order, from stancemining's STANCE_LABELS_2_ID
+PROB_LABELS = ['neutral', 'favor', 'against']
+PROB_COLUMNS = [f'model_prob_{label}' for label in PROB_LABELS]
+
 DEFAULT_STANCE_DIR = './data/stance_targets/noun_phrase_stance'
 DEFAULT_RAW_DIR = '../sitrep/data/digital_trace/raw_platforms'
 
@@ -45,6 +52,14 @@ PARTY_ALIASES = {
 
 # instagram shortcodes are the media pk written in this base-64 alphabet
 IG_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_'
+
+# raw fields each platform's classified document can be built from, for text_source.
+# Twitter is not listed: a tweet is always the author's own writing.
+RAW_TEXT_COLUMNS = {
+    'tiktok': ['video_id', 'desc'],
+    'instagram': ['id', 'caption', 'description'],
+    'bluesky': ['id', 'text', 'original_post_text', 'embed_title', 'embed_description'],
+}
 
 # federal and provincial parties are collapsed into families for stratification, so
 # that we don't end up with one stratum per provincial party. The exact party name
@@ -279,53 +294,207 @@ def instagram_shortcode(post_id):
     return shortcode
 
 
-def bluesky_did(post_id):
-    """Bluesky ids are '<cid>_<did>_<reason>'."""
-    parts = post_id.split('_')
-    return parts[1] if len(parts) > 1 and parts[1].startswith('did:') else None
+def bluesky_parts(post_id):
+    """The did and cid of a bluesky post; the crawl has written them in either order."""
+    parts = [part for part in post_id.split('_') if part]
+    did = next((part for part in parts if part.startswith('did:')), None)
+    cid = next((part for part in parts if part.startswith('baf')), None)
+    return did, cid
 
 
-def resolve_bluesky_uris(post_df, raw_dir):
+def resolve_bluesky_uris(post_df, raw_dirs):
     """Look up the at:// uri of each bluesky post in the raw crawl files.
 
-    The stance data keeps the post cid, but a bsky.app URL needs the record key,
-    so we have to go back to the raw daily files to recover it.
+    The stance data keeps the post cid, but a bsky.app URL needs the record key.
+    Only some vintages of the crawl carry the uri, so each given dir is searched.
     """
     bluesky_df = post_df.filter(pl.col('platform') == 'bluesky')
     if bluesky_df.is_empty():
         return {}
-    if not os.path.isdir(raw_dir):
-        print(f"Warning: raw platform dir {raw_dir} not found, bluesky posts will fall back "
-              f"to profile URLs", file=sys.stderr)
-        return {}
 
-    wanted = set(bluesky_df['id'].to_list())
-    # a post crawled on day D can sit in the file for D or D-1
-    dates = set()
-    for post_date in bluesky_df.select(pl.col('createtime').dt.date())['createtime'].to_list():
-        for offset in (-1, 0, 1):
-            dates.add(post_date + datetime.timedelta(days=offset))
+    id_by_cid = {}
+    for post_id in bluesky_df['id'].to_list():
+        _, cid = bluesky_parts(post_id)
+        if cid:
+            id_by_cid[cid] = post_id
 
     uri_by_id = {}
-    for date in sorted(dates):
-        path = os.path.join(raw_dir, f'bluesky_{date.isoformat()}.parquet.zstd')
-        if not os.path.exists(path):
-            continue
-        raw_df = pl.read_parquet(path, columns=['id', 'uri']).filter(pl.col('id').is_in(wanted))
-        for post_id, uri in raw_df.iter_rows():
-            if uri:
-                uri_by_id.setdefault(post_id, uri)
-        if len(uri_by_id) == len(wanted):
+    dates = sorted(_raw_dates(bluesky_df, 'bluesky'))
+    for raw_dir in raw_dirs:
+        if len(uri_by_id) == len(id_by_cid):
             break
-    missing = len(wanted) - len(uri_by_id)
+        if not os.path.isdir(raw_dir):
+            print(f"Warning: raw platform dir {raw_dir} not found, bluesky posts may fall "
+                  f"back to profile URLs", file=sys.stderr)
+            continue
+        for date in dates:
+            path = os.path.join(raw_dir, f'bluesky_{date.isoformat()}.parquet.zstd')
+            if not os.path.exists(path):
+                continue
+            columns = pl.scan_parquet(path).collect_schema().names()
+            if 'uri' not in columns:
+                continue
+            key = 'cid' if 'cid' in columns else 'id'
+            for raw_key, uri in pl.read_parquet(path, columns=[key, 'uri']).iter_rows():
+                _, cid = bluesky_parts(raw_key or '')
+                post_id = id_by_cid.get(cid or raw_key)
+                if post_id and uri:
+                    uri_by_id.setdefault(post_id, uri)
+            if len(uri_by_id) == len(id_by_cid):
+                break
+
+    missing = len(id_by_cid) - len(uri_by_id)
     if missing:
-        print(f"Warning: could not resolve {missing}/{len(wanted)} bluesky post URLs", file=sys.stderr)
+        print(f"Warning: could not resolve {missing}/{len(id_by_cid)} bluesky post URLs",
+              file=sys.stderr)
     return uri_by_id
 
 
-def add_post_urls(post_df, raw_dir):
+def _raw_dates(post_df, platform):
+    """Days whose raw file could hold these posts, crawl date lagging the post date."""
+    dates = set()
+    posts = post_df.filter(pl.col('platform') == platform)
+    for post_date in posts.select(pl.col('createtime').dt.date())['createtime'].to_list():
+        for offset in (-1, 0, 1):
+            dates.add(post_date + datetime.timedelta(days=offset))
+    return sorted(dates)
+
+
+def _read_raw(raw_dir, platform, dates, columns, wanted):
+    """Raw records for the wanted ids, gathered over the candidate days.
+
+    Raw schemas drift across the crawl, so only the columns a file actually has are
+    read and the rest come back null.
+    """
+    frames = []
+    found = set()
+    id_column = columns[0]
+    for date in dates:
+        path = os.path.join(raw_dir, f'{platform}_{date.isoformat()}.parquet.zstd')
+        if not os.path.exists(path):
+            continue
+        available = pl.scan_parquet(path).collect_schema().names()
+        take = [c for c in columns if c in available]
+        if id_column not in take:
+            continue
+        df = pl.read_parquet(path, columns=take)\
+            .with_columns(pl.col(id_column).cast(pl.String).alias('id'))\
+            .filter(pl.col('id').is_in(wanted) & ~pl.col('id').is_in(found))\
+            .unique('id')
+        if df.is_empty():
+            continue
+        found.update(df['id'].to_list())
+        frames.append(df.select(['id'] + [c for c in take if c != id_column]))
+        if len(found) == len(wanted):
+            break
+    if not frames:
+        return None
+    return pl.concat(frames, how='diagonal')
+
+
+def _concat_source(document, caption, appended):
+    """A caption with machine-read text appended: which of the two the model saw.
+
+    Truncation in get_stance only ever shortens the document, so a document that is
+    a prefix of the caption still came from the caption alone.
+    """
+    if not document:
+        return 'unknown'
+    if not caption:
+        return appended
+    if document == caption or caption.startswith(document):
+        return 'caption'
+    if document.startswith(caption):
+        return f'caption+{appended}'
+    return 'unknown'
+
+
+def _coalesced_source(document, options):
+    """Fields the document is one of, rather than a concatenation of."""
+    if not document:
+        return 'unknown'
+    for label, value in options:
+        if value and (document == value or value.startswith(document)):
+            return label
+    return 'unknown'
+
+
+def _clean_text(value):
+    return (value or '').strip()
+
+
+def resolve_text_sources(post_df, raw_dir):
+    """Which raw fields each classified document was assembled from.
+
+    A tiktok document is the caption then whatever was said in the video, an
+    instagram one the caption then whatever was read off the image, and a bluesky
+    one the post's own text or, failing that, the text it reposted or the card it
+    linked. Only the raw record says which of those a given document is, and the
+    evaluation needs it to report transcript-derived posts as their own subgroup.
+    """
+    sources = {}
+    for post_id, platform in post_df.filter(pl.col('platform') == 'twitter')\
+            .select(['id', 'platform']).iter_rows():
+        sources[(platform, post_id)] = 'written'
+
+    remaining = post_df.filter(pl.col('platform').is_in(list(RAW_TEXT_COLUMNS)))
+    if remaining.is_empty():
+        return sources
+    if not os.path.isdir(raw_dir):
+        print(f"Warning: raw platform dir {raw_dir} not found, text_source will be "
+              f"unknown for {remaining.height} posts", file=sys.stderr)
+        return sources
+
+    for platform, columns in RAW_TEXT_COLUMNS.items():
+        posts = remaining.filter(pl.col('platform') == platform)
+        if posts.is_empty():
+            continue
+        wanted = set(posts['id'].to_list())
+        raw_df = _read_raw(raw_dir, platform, _raw_dates(post_df, platform),
+                           columns, wanted)
+        raw = {} if raw_df is None else {r['id']: r for r in raw_df.to_dicts()}
+        for post_id, document in posts.select(['id', 'Document']).iter_rows():
+            record = raw.get(post_id)
+            document = _clean_text(document)
+            if record is None:
+                sources[(platform, post_id)] = 'unknown'
+            elif platform == 'tiktok':
+                sources[(platform, post_id)] = _concat_source(
+                    document, _clean_text(record.get('desc')), 'transcript')
+            elif platform == 'instagram':
+                caption = record.get('caption')
+                caption = caption.get('text') if isinstance(caption, dict) else caption
+                sources[(platform, post_id)] = _concat_source(
+                    document, _clean_text(caption or record.get('description')), 'ocr')
+            else:
+                card = ' '.join(part for part in
+                                (_clean_text(record.get('embed_title')),
+                                 _clean_text(record.get('embed_description'))) if part)
+                sources[(platform, post_id)] = _coalesced_source(document, [
+                    ('written', _clean_text(record.get('text'))),
+                    ('repost text', _clean_text(record.get('original_post_text'))),
+                    ('link card', card.strip()),
+                ])
+        unresolved = sum(1 for post_id in wanted
+                         if sources.get((platform, post_id), 'unknown') == 'unknown')
+        if unresolved:
+            print(f"Warning: could not tell what {unresolved}/{len(wanted)} {platform} "
+                  f"documents were built from", file=sys.stderr)
+    return sources
+
+
+def add_text_sources(post_df, raw_dir):
+    sources = resolve_text_sources(post_df, raw_dir)
+    return post_df.with_columns(
+        pl.struct(['platform', 'id'])
+        .map_elements(lambda r: sources.get((r['platform'], r['id']), 'unknown'),
+                      return_dtype=pl.String)
+        .alias('text_source'))
+
+
+def add_post_urls(post_df, raw_dirs):
     """Add a browsable URL per post, plus whether it points at the post or the account."""
-    uri_by_id = resolve_bluesky_uris(post_df, raw_dir)
+    uri_by_id = resolve_bluesky_uris(post_df, raw_dirs)
 
     urls = []
     kinds = []
@@ -349,7 +518,7 @@ def add_post_urls(post_df, raw_dir):
                 kind = 'profile'
         elif platform == 'bluesky':
             uri = uri_by_id.get(post_id)
-            did = bluesky_did(post_id)
+            did, _ = bluesky_parts(post_id)
             if uri and uri.startswith('at://'):
                 uri_did, _, rkey = uri[len('at://'):].partition('/app.bsky.feed.post/')
                 if rkey:
@@ -370,7 +539,8 @@ def add_post_urls(post_df, raw_dir):
 OUTPUT_COLUMNS = [
     'post_url', 'url_kind', 'platform', 'createtime', 'year', 'seed_name', 'handle',
     'main_type', 'sub_type', 'party', 'party_family', 'actor_group', 'province',
-    'electoral_district', 'n_post_targets', 'n_sampled_targets', 'pair_weight',
+    'electoral_district', 'text_source', 'n_post_targets', 'n_sampled_targets',
+    'pair_weight',
 ]
 
 
@@ -406,6 +576,44 @@ def sample_targets(post_df, max_targets, seed, keep_pairs=None):
     )
 
 
+def add_class_probs(long_df, probs_dir, stance_files):
+    """Join the classifier's per-class probabilities onto each sampled pair.
+
+    The probabilities are written to their own weekly files, keyed by (id, platform)
+    with one probability vector per extracted target.
+    """
+    frames = []
+    for stance_file in sorted(stance_files):
+        name = os.path.basename(stance_file).replace(STANCE_FILE_SUFFIX, PROBS_FILE_SUFFIX)
+        path = os.path.join(probs_dir, name)
+        if not os.path.exists(path):
+            continue
+        week = pl.read_parquet(path, columns=['id', 'platform', 'Targets', 'Probs'])\
+            .explode(['Targets', 'Probs'])\
+            .rename({'Targets': 'target'})\
+            .drop_nulls(['target', 'Probs'])\
+            .join(long_df.select(['id', 'platform', 'target']),
+                  on=['id', 'platform', 'target'], how='semi')
+        if week.height:
+            frames.append(week)
+
+    if not frames:
+        print(f"Warning: no probabilities in {probs_dir} match the sample", file=sys.stderr)
+        return long_df
+
+    probs = pl.concat(frames).unique(['id', 'platform', 'target'])
+    probs = probs.with_columns(
+        [pl.col('Probs').list.get(i).alias(column)
+         for i, column in enumerate(PROB_COLUMNS)]).drop('Probs')
+    long_df = long_df.join(probs, on=['id', 'platform', 'target'], how='left')
+
+    missing = long_df[PROB_COLUMNS[0]].null_count()
+    if missing:
+        print(f"Warning: {missing}/{long_df.height} sampled pairs have no class "
+              f"probabilities", file=sys.stderr)
+    return long_df
+
+
 def check_carried_over(long_df, keep_pairs):
     """Confirm every already-coded pair made it into the new sample."""
     if not keep_pairs:
@@ -428,10 +636,11 @@ def check_carried_over(long_df, keep_pairs):
 
 def format_output(long_df, layout):
     """One row per (post, target) pair, or one row per post with the targets collapsed."""
+    prob_columns = [c for c in PROB_COLUMNS if c in long_df.columns]
     if layout == 'long':
         return long_df.select(
             OUTPUT_COLUMNS
-            + ['target', 'stance']
+            + ['target', 'stance'] + prob_columns
             + [pl.col('Document').alias('post_text'), pl.col('ParentDocument').alias('parent_text'),
                pl.col('id').alias('post_id')]
         ).sort(['platform', 'createtime', 'post_id', 'target'])
@@ -484,11 +693,54 @@ def print_summary(post_df, long_df, output_df):
     for row in classified.group_by('n_post_targets').len(name='posts').sort('n_post_targets').to_dicts():
         print(f"    {row['n_post_targets']}: {row['posts']}")
 
-    for column in ['platform', 'year', 'actor_group', 'url_kind']:
+    for column in ['platform', 'year', 'actor_group', 'url_kind', 'text_source']:
         counts = post_df.group_by(column).len().sort(column)
         print(f"\nposts per {column}:")
         for row in counts.to_dicts():
             print(f"  {row[column]}: {row['len']}")
+
+
+def selftest():
+    """Check the text_source rules, which the raw data this runs against is needed to
+    exercise otherwise."""
+    # tiktok and instagram append machine-read text to the caption
+    assert _concat_source('a caption', 'a caption', 'transcript') == 'caption'
+    assert _concat_source('a caption\nwhat was said', 'a caption', 'transcript') \
+        == 'caption+transcript'
+    assert _concat_source('what was said', '', 'transcript') == 'transcript'
+    assert _concat_source('a cap', 'a caption', 'transcript') == 'caption'  # truncated
+    assert _concat_source('something else', 'a caption', 'transcript') == 'unknown'
+    assert _concat_source('', 'a caption', 'transcript') == 'unknown'
+    assert _concat_source('a caption\nread off the image', 'a caption', 'ocr') \
+        == 'caption+ocr'
+
+    # bluesky documents stand in for one field or another
+    options = [('written', 'my own words'), ('repost text', 'what they said'),
+               ('link card', 'Headline A story')]
+    assert _coalesced_source('my own words', options) == 'written'
+    assert _coalesced_source('what they said', options) == 'repost text'
+    assert _coalesced_source('Headline A story', options) == 'link card'
+    assert _coalesced_source('my own', options) == 'written'          # truncated
+    assert _coalesced_source('none of them', options) == 'unknown'
+    assert _coalesced_source('what they said', [('written', ''),
+                                                ('repost text', 'what they said')]) \
+        == 'repost text'
+
+    # both vintages of the bluesky id, and the ids of the platforms that have none
+    assert bluesky_parts('did:plc:abc__bafyreidef') == ('did:plc:abc', 'bafyreidef')
+    assert bluesky_parts('bafyreidef_did:plc:abc_repost') == ('did:plc:abc', 'bafyreidef')
+    assert bluesky_parts('1897407239302078491') == (None, None)
+
+    # a tweet needs no raw lookup, and a missing raw dir leaves the rest unknown
+    post_df = pl.DataFrame({
+        'id': ['1', '2'],
+        'platform': ['twitter', 'tiktok'],
+        'createtime': [datetime.datetime(2025, 1, 1), datetime.datetime(2025, 1, 1)],
+        'Document': ['a tweet', 'a caption'],
+    })
+    out_df = add_text_sources(post_df, '/nonexistent-raw-dir')
+    assert out_df.sort('id')['text_source'].to_list() == ['written', 'unknown']
+    print('selftest: text_source rules pass')
 
 
 def main():
@@ -503,13 +755,28 @@ def main():
                              '(repeatable)')
     parser.add_argument('--stance-dir', default=DEFAULT_STANCE_DIR,
                         help='dir of *_doc_targets_with_stance.parquet.zstd files')
+    parser.add_argument('--probs-dir',
+                        help='dir of *_doc_targets_stance_probs.parquet.zstd files, whose '
+                             'per-class probabilities are joined onto each sampled pair '
+                             '(default: the stance dir with a _probs suffix, if it exists)')
     parser.add_argument('--raw-dir', default=DEFAULT_RAW_DIR,
-                        help='dir of raw daily platform files, used to recover bluesky post URLs')
+                        help='dir of raw daily platform files, used to recover bluesky '
+                             'post URLs and what each document was built from')
+    parser.add_argument('--uri-dir', action='append', default=[], metavar='DIR',
+                        help='another dir of raw daily files to search for bluesky at:// '
+                             'uris, for vintages of the crawl whose current files no longer '
+                             'carry them (repeatable)')
+    parser.add_argument('--selftest', action='store_true',
+                        help='verify the text_source rules and exit')
     parser.add_argument('--format', choices=['long', 'wide'], default='long',
                         help='one row per (post, target) pair, or one row per post')
     parser.add_argument('--output', default='./out/classified_post_sample.csv',
                         help='output path, .csv or .parquet')
     args = parser.parse_args()
+
+    if args.selftest:
+        selftest()
+        return
 
     keep_posts, keep_pairs = load_previous(args.include)
     if args.include:
@@ -521,8 +788,16 @@ def main():
 
     sample_df = choose_sample(candidate_df, args.num_posts, args.seed, keep_posts)
     post_df = load_sampled_posts(sample_df)
-    post_df = add_post_urls(post_df, args.raw_dir)
+    post_df = add_post_urls(post_df, [args.raw_dir] + args.uri_dir)
+    post_df = add_text_sources(post_df, args.raw_dir)
     long_df = sample_targets(post_df, args.max_targets_per_post, args.seed, keep_pairs)
+
+    probs_dir = args.probs_dir or f'{args.stance_dir.rstrip("/")}_probs'
+    if os.path.isdir(probs_dir):
+        long_df = add_class_probs(long_df, probs_dir, sample_df['source_file'].unique().to_list())
+    elif args.probs_dir:
+        print(f"Warning: probs dir {probs_dir} not found", file=sys.stderr)
+
     output_df = format_output(long_df, args.format)
 
     output_dir = os.path.dirname(args.output)
