@@ -18,7 +18,8 @@ Reads one or more CSVs exported by the coding page (make_coding_page.py) and rep
     where the sample carries per-class probabilities, a reliability table with ECE,
     MCE, Brier score and NLL
   * subgroup error rates -- extraction and stance error per platform, year,
-    political group, actor type and text provenance, with the worst-group gap
+    political group, actor type, language and text provenance, with the worst-group
+    gap; years read oldest first and political groups in seat order
   * every pair where the model and the coder disagree, for error analysis
 
 Agreement statistics: with one coder the model-vs-coder pair is scored with Cohen's
@@ -31,13 +32,15 @@ Confidence intervals are percentile bootstrap over pairs for headline numbers an
 Wilson score intervals for the subgroup proportions, where cells get small enough
 that the bootstrap degenerates. Both are seeded, so reruns match.
 
-Columns the coding page does not carry -- text provenance, per-class probabilities --
-can be joined on from the sample they were drawn from with --sample.
+Columns the coding page does not carry -- text provenance, per-class probabilities,
+the post text the English/French split is read off -- can be joined on from the
+sample they were drawn from with --sample.
 
 The report is written to stdout. --output also saves it; give that a .tex path and
 the results come out as booktabs tabulars instead, one tabular per file, named after
 that path, with no table environment or caption, so each can be \\input where its
-caption is written.
+caption is written. One of them is a reduced table -- macro-F1 and kappa, overall
+and per subgroup, no intervals -- for where the full ones do not fit.
 
 Examples:
     python scripts/target_mining/score_coded_posts.py -i out/stance_coding_coder_2026-07-29.csv
@@ -53,6 +56,7 @@ import csv
 import math
 import os
 import random
+import re
 from collections import Counter, OrderedDict, defaultdict
 
 STANCES = ['FAVOR', 'AGAINST', 'NEUTRAL']
@@ -69,6 +73,7 @@ BREAKDOWNS = [
     (('party_family', 'party'), 'political group'),
     (('main_type',), 'actor type'),
     (('actor_group',), 'actor group'),
+    (('language',), 'language'),
     (('text_kind',), 'text provenance'),
     (('text_source',), 'text source'),
     (('model_stance',), 'model label'),
@@ -97,8 +102,34 @@ CONFIDENCE_COLUMN = 'model_confidence'
 # transcript-derived subgroup turns on
 TEXT_KINDS = [('transcript', 'transcript (ASR)'), ('ocr', 'image text (OCR)')]
 
+# function words and elisions that separate the corpus's two languages; a post goes
+# to whichever side its text hits more often, so neither list has to be exhaustive.
+# Words that read the same in both (a, on, plus, son, note) are left out.
+ENGLISH_WORDS = {
+    'the', 'and', 'is', 'to', 'of', 'in', 'for', 'that', 'with', 'this', 'it',
+    'we', 'you', 'are', 'have', 'not', 'be', 'his', 'her', 'they', 'our', 'from',
+    'all', 'will', 'what', 'who', 'how', 'more', 'has', 'about', 'been', 'their',
+    'was', 'would', 'should', 'can', 'need', 'today', 'people', 'government',
+}
+FRENCH_WORDS = {
+    'le', 'la', 'les', 'des', 'du', 'de', 'et', 'est', 'une', 'un', 'dans',
+    'pour', 'que', 'qui', 'pas', 'nous', 'vous', 'aux', 'avec', 'cette', 'sont',
+    'ils', 'elle', 'leur', 'mais', 'ne', 'ce', 'ces', 'aussi', 'comme', 'tous',
+    'plusieurs', 'gouvernement', 'aujourd', 'canadiens', 'travail',
+}
+FRENCH_ELISION = re.compile(r"\b(?:l|d|qu|j|n|c|m|t|s)'", re.IGNORECASE)
+UNDETERMINED = 'undetermined'
+WORD_RE = re.compile(r"[^\W\d_]+", re.UNICODE)
+
 # subgroup rates below this many pairs are reported but marked as too thin to read
 DEFAULT_MIN_CELL = 20
+
+# the political groups are read in seat order, then everyone else by sample size
+PARTY_ORDER = ['liberal', 'conservative', 'ndp', 'bloc', 'green']
+
+# the sample's party_family column already folds the smallest parties into one group;
+# these are the ones left over that are still too thin for a row of their own
+PARTY_FOLD = {'ppc': 'Other party', "people's party of canada": 'Other party'}
 
 # ---------------------------------------------------------------- statistics
 
@@ -391,6 +422,25 @@ def add_text_kind(row):
                                 'written')
 
 
+def add_language(row):
+    """Label the post English or French, for the language subgroup.
+
+    Nothing upstream records a language, so it is read off the post text joined on
+    with --sample; a post with no text either way stays undetermined.
+    """
+    text = (row.get('post_text') or '').strip()
+    if not text:
+        return
+    words = WORD_RE.findall(text.lower())
+    english = sum(1 for w in words if w in ENGLISH_WORDS)
+    french = sum(1 for w in words if w in FRENCH_WORDS)
+    french += len(FRENCH_ELISION.findall(text))
+    if english == french:
+        row['language'] = UNDETERMINED
+    else:
+        row['language'] = 'English' if english > french else 'French'
+
+
 def load_coding(paths, aux_paths=()):
     """Read each coded CSV into {pair_key: row}, keyed identically across coders."""
     aux = load_aux(aux_paths)
@@ -412,6 +462,7 @@ def load_coding(paths, aux_paths=()):
                 if not (r.get(column) or '').strip():
                     r[column] = value
             add_text_kind(r)
+            add_language(r)
             table[key] = r
             meta.setdefault(key, r)
         coders[name] = table
@@ -477,28 +528,43 @@ def in_breakdown(row, column):
     """Whether a row belongs in a breakdown at all.
 
     The party of an influencer or a foreign account is incidental, so the political
-    group breakdown covers politicians; the actor type breakdown carries the rest.
-    A row whose actor type is unrecorded is kept, since it cannot be ruled out.
+    group breakdown covers politicians who sit for a party; the actor type breakdown
+    carries the rest, and a non-partisan office -- a mayoralty, a consensus-government
+    seat, a senate appointment -- is not a group to read a rate off. A row whose actor
+    type is unrecorded is kept, since it cannot be ruled out. A post whose language
+    could not be read has no place in the language cut either.
     """
+    if column == 'language':
+        return (row.get('language') or '').strip() != UNDETERMINED
     if column not in ('party', 'party_family'):
         return True
+    if not (row.get(column) or '').strip():
+        return False
     return (row.get('main_type') or '').strip().lower() in ('', 'politician')
 
 
-def blank_label(row, column):
-    """What an empty cell means, where it means something specific.
-
-    A politician with no party holds a non-partisan office -- a mayoralty, a seat in
-    a consensus-government legislature, a senate appointment -- rather than having
-    an unrecorded one.
-    """
-    if column in ('party', 'party_family'):
-        return 'unaffiliated politician'
-    return '(blank)'
-
-
 def group_of(row, column):
-    return (row.get(column) or '').strip() or blank_label(row, column)
+    group = (row.get(column) or '').strip() or '(blank)'
+    if column in ('party', 'party_family'):
+        return PARTY_FOLD.get(group.lower(), group)
+    return group
+
+
+def group_sort_key(column, group, size):
+    """Years run oldest first and parties in seat order; every other cut by size."""
+    if column == 'year':
+        return (0, group, 0)
+    if column in ('party', 'party_family'):
+        name = group.lower()
+        rank = next((i for i, p in enumerate(PARTY_ORDER) if name.startswith(p)),
+                    len(PARTY_ORDER))
+        return (rank, '', -size)
+    return (0, '', -size)
+
+
+def sort_groups(column, items, size_of=len):
+    """Breakdown groups in the order the tables read them, largest cell first."""
+    return sorted(items, key=lambda kv: group_sort_key(column, kv[0], size_of(kv[1])))
 
 
 def stance_pairs(table, relevant_only):
@@ -864,10 +930,10 @@ def report_calibration(out, name, table, seed, n_bins):
         out(line)
 
 
-def subgroup_rows(items, min_cell):
+def subgroup_rows(column, items, min_cell):
     """(group, n, errors, rate, Wilson CI, thin) for {group: [error flags]}."""
     rows = []
-    for group, flags in sorted(items.items(), key=lambda kv: -len(kv[1])):
+    for group, flags in sort_groups(column, items.items()):
         errors = sum(flags)
         rows.append([group, len(flags), errors, pct(errors / len(flags)),
                      pct_ci(wilson_ci(errors, len(flags))),
@@ -917,7 +983,7 @@ def report_subgroups(out, name, table, seed, min_cell):
 
         out('')
         out(f'by {label} ({column}) -- extraction:')
-        extraction_rows = subgroup_rows(extraction, min_cell)
+        extraction_rows = subgroup_rows(column, extraction, min_cell)
         out.table(['group', 'coded', 'not relevant', 'extraction error', '95% CI', ''],
                   extraction_rows)
         report_gap(out, extraction_rows, min_cell, label)
@@ -925,7 +991,7 @@ def report_subgroups(out, name, table, seed, min_cell):
         out('')
         out(f'by {label} ({column}) -- stance:')
         stance_rows = []
-        for group, flags in sorted(stance.items(), key=lambda kv: -len(kv[1])):
+        for group, flags in sort_groups(column, stance.items()):
             group_pairs = [(g, p) for _, r, g, p in pairs
                            if in_breakdown(r, column)
                            and group_of(r, column) == group]
@@ -1025,6 +1091,11 @@ def tex(value):
     return ''.join(LATEX_SPECIALS.get(c, c) for c in str(value))
 
 
+def short(x):
+    """Two decimals, for the reduced table where the third carries no weight."""
+    return 'n/a' if isinstance(x, float) and math.isnan(x) else f'{x:.2f}'
+
+
 def tex_pct(x):
     """A rate as a bare number; the column header carries the unit."""
     return 'n/a' if isinstance(x, float) and math.isnan(x) else f'{100 * x:.1f}'
@@ -1035,6 +1106,20 @@ def tex_pct_ci(bounds):
     if any(isinstance(v, float) and math.isnan(v) for v in (lo, hi)):
         return ''
     return f'[{100 * lo:.1f}, {100 * hi:.1f}]'
+
+
+def tex_cut(label, rows):
+    """A cut's name, stacked one word per line to keep its column narrow.
+
+    The lines after the first are set to no height, so they fall into the empty cells
+    under them and a two-word cut costs no vertical space -- as long as its block has
+    the rows to spare.
+    """
+    words = [tex(w) for w in label.split()]
+    if len(words) < 2 or rows < len(words):
+        return tex(label)
+    return (r'\raisebox{0pt}[0pt][0pt]{\begin{tabular}[t]{@{}l@{}}'
+            + r' \\ '.join(words) + r'\end{tabular}}')
 
 
 def tex_row(cells):
@@ -1213,11 +1298,12 @@ def tex_reliability(table, seed, n_bins):
                                    'Gap'])], body))]
 
 
-def tex_subgroups(table, min_cell):
+def subgroup_blocks(table):
+    """(label, column, ordered groups) per breakdown the paper tables cut by."""
     rows = list(table.values())
     coded = [(k, r) for k, r in table.items() if relevance_of(r) is not None]
     pairs = stance_pairs(table, relevant_only=True)
-    body = []
+    blocks = []
     for columns, label in PAPER_ERROR_BREAKDOWNS:
         column = present_column(rows, columns)
         if column is None:
@@ -1239,9 +1325,17 @@ def tex_subgroups(table, min_cell):
                 cell(group_of(r, column))['stance'].append((gold, pred))
         if len(groups) < 2:
             continue
+        ordered = sort_groups(column, groups.items(),
+                              size_of=lambda v: len(v['extraction']))
+        blocks.append((label, column, ordered))
+    return blocks
+
+
+def tex_subgroups(table, min_cell):
+    body = []
+    for label, _, groups in subgroup_blocks(table):
         body.append(tex_block(label, 10))
-        for group, v in sorted(groups.items(),
-                               key=lambda kv: -len(kv[1]['extraction'])):
+        for group, v in groups:
             extraction, stance = v['extraction'], v['stance']
             thin = len(stance) < min_cell or len(extraction) < min_cell
             cells = [tex(group) + (THIN_MARK if thin else ''), len(v['posts']),
@@ -1280,6 +1374,42 @@ def tex_subgroups(table, min_cell):
              tex_tabular('lrrrrrrrrr', header, body))]
 
 
+def tex_reduced(table, min_cell):
+    """The short table: how well the model scores overall, then cut by subgroup.
+
+    Only the relevant targets and the two summary statistics, and the cut each row
+    belongs to is a column rather than a heading row, so the whole evaluation fits
+    one column of the paper.
+    """
+
+    def scores(pairs):
+        golds = [g for g, _ in pairs]
+        preds = [p for _, p in pairs]
+        return [short(prf(golds, preds, STANCES)['macro']['f1']),
+                short(cohen_kappa(golds, preds, STANCES))]
+
+    overall = [(g, p) for _, _, g, p in stance_pairs(table, relevant_only=True)]
+    if len(overall) < 2:
+        return []
+    body = [tex_row(['All posts', 'coded relevant', len(overall)] + scores(overall)),
+            r'\midrule']
+    for label, _, groups in subgroup_blocks(table):
+        cut = tex_cut(label[:1].upper() + label[1:], len(groups))
+        for i, (group, v) in enumerate(groups):
+            stance = v['stance']
+            cells = [cut if i == 0 else '',
+                     tex(group) + (THIN_MARK if len(stance) < min_cell else ''),
+                     len(stance)]
+            body.append(tex_row(cells + (scores(stance) if stance else ['', ''])))
+        body.append(r'\midrule')
+    header = [tex_row(['', 'Subgroup', '$n$', r'$\overline{F}_1$', r'$\kappa$'])]
+    return [('reduced',
+             f'stance agreement overall and per subgroup, on the targets coded '
+             f'relevant; the bar is the macro average over the three classes and '
+             f'$\\kappa$ is Cohen\'s; dagger marks fewer than {min_cell} pairs',
+             tex_tabular('@{}llrrr@{}', header, body))]
+
+
 def latex_tables(coders, meta, seed, min_cell, n_bins):
     """(file slug, lines) per result tabular, captions left to the author.
 
@@ -1290,7 +1420,7 @@ def latex_tables(coders, meta, seed, min_cell, n_bins):
     for name, table in coders.items():
         per_coder = (tex_extraction(table, seed) + tex_agreement(table, seed)
                      + tex_per_class(table) + tex_reliability(table, seed, n_bins)
-                     + tex_subgroups(table, min_cell))
+                     + tex_subgroups(table, min_cell) + tex_reduced(table, min_cell))
         suffix = '' if len(coders) == 1 else f'_{tex_slug(name)}'
         tables += [(slug + suffix, comment, lines)
                    for slug, comment, lines in per_coder]
@@ -1429,17 +1559,44 @@ def selftest():
     add_text_kind(blank)
     assert 'text_kind' not in blank
 
+    for text, language in [
+            ('We need a government that works for people, not for the few',
+             'English'),
+            ("Le gouvernement doit travailler pour les gens d'ici, pas pour "
+             "quelques-uns", 'French'),
+            ('', None), ('2026 !!!', 'undetermined')]:
+        row = {'post_text': text}
+        add_language(row)
+        assert row.get('language') == language, (text, row)
+
+    # years read oldest first, parties in seat order, everything else largest first
+    years = {'2025': [0] * 3, '2022': [0], '2024': [0] * 9}
+    assert [g for g, _ in sort_groups('year', years.items())] == ['2022', '2024', '2025']
+    parties = {'Green': [0] * 8, 'NDP': [0] * 2, 'Liberal': [0], 'PPC': [0] * 5,
+               'Bloc Québécois': [0] * 3, 'Conservative': [0],
+               'Independent': [0] * 9}
+    assert [g for g, _ in sort_groups('party', parties.items())] == [
+        'Liberal', 'Conservative', 'NDP', 'Bloc Québécois', 'Green',
+        'Independent', 'PPC']
+    platforms = {'tiktok': [0], 'twitter': [0] * 4}
+    assert [g for g, _ in sort_groups('platform', platforms.items())] == ['twitter',
+                                                                          'tiktok']
+
     rows = [{'party': 'Liberal', 'party_family': ''}, {'party': '', 'party_family': ''}]
     assert present_column(rows, ('party_family', 'party')) == 'party'
     assert present_column(rows, ('text_kind',)) is None
-    assert group_of(rows[1], 'party') == 'unaffiliated politician'
     assert group_of(rows[1], 'platform') == '(blank)'
     assert group_of({'party': 'Liberal', 'main_type': 'politician'}, 'party') == 'Liberal'
-    # the political group breakdown is politicians, plus rows with no actor type
+    assert group_of({'party_family': 'PPC'}, 'party_family') == 'Other party'
+    # the political group breakdown is politicians who sit for a party, plus rows
+    # with no actor type; a post of no readable language is out of the language cut
     for kind, keep in [('politician', True), ('influencer', False), ('foreign', False),
                        ('', True)]:
-        assert in_breakdown({'main_type': kind}, 'party') is keep
+        assert in_breakdown({'main_type': kind, 'party': 'Liberal'}, 'party') is keep
         assert in_breakdown({'main_type': kind}, 'platform') is True
+    assert in_breakdown({'main_type': 'politician', 'party': ''}, 'party') is False
+    assert in_breakdown({'language': 'French'}, 'language') is True
+    assert in_breakdown({'language': UNDETERMINED}, 'language') is False
     print('selftest: all statistics checks pass')
 
 
@@ -1456,8 +1613,8 @@ def main():
                              'out/coding_composition.tex and its siblings')
     parser.add_argument('-s', '--sample', action='append', default=[], metavar='CSV',
                         help='the sample the pairs were drawn from, to join on columns '
-                             'the coding page does not carry (text_source, class '
-                             'probabilities); repeatable')
+                             'the coding page does not carry (text_source, post text, '
+                             'class probabilities); repeatable')
     parser.add_argument('--show-disagreements', type=int, default=25,
                         help='how many disagreements to list (0 = all)')
     parser.add_argument('--min-cell', type=int, default=DEFAULT_MIN_CELL,
