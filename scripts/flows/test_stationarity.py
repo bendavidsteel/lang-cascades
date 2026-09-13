@@ -378,6 +378,34 @@ def analysed():   # one run, six assertions over it
                       log=quiet)
 
 
+@pytest.fixture(scope='module')
+def analysed_all_fast():
+    """A homogeneous prior: every dimension is fast, so there is no control."""
+    quiet = lambda *a, **k: None
+    v = variogram.verdict(_rows([0.0, 0.4, 0.7, 0.9, 1.0, 1.0, 1.0, 1.0]),
+                          _rows([0.0] * 8))
+    return st.analyse(synthetic_frame(), 'causal_4d', 'sd_4d', 16.0,
+                      [0, 1, 2, 3], [], v, n_boot=99, n_windows=4, min_bins=30,
+                      min_seeds=10, log=quiet)
+
+
+def test_analyse_skips_the_control_when_no_dimension_is_slow(analysed_all_fast):
+    assert 'msd_slow' not in analysed_all_fast
+    assert 'slow' not in analysed_all_fast['panel']
+    assert analysed_all_fast['panel']['fast']['by_dim']
+
+
+def test_the_report_runs_without_a_control_block(analysed_all_fast, tmp_path):
+    lines = []
+    st.summarise(analysed_all_fast, log=lines.append)
+    assert any('every dimension is fast' in ln for ln in lines)
+
+    table, _ = st.write_tex(analysed_all_fast, cfg=None, out_dir=str(tmp_path))
+    body = open(table).read()
+    assert 'slow (control)' not in body
+    assert 'no slow block configured' in body
+
+
 def test_analyse_produces_every_key_the_report_reads(analysed):
     for key in ('blocks', 'dt_days', 'panel_shape', 'variogram', 'msd_raw',
                 'msd_demeaned', 'msd_slow', 'panel', 'window',

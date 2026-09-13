@@ -752,11 +752,13 @@ def write_tex(results, cfg, out_dir=None):
          f"($p \\leq {_fmt(p['fast_smoothed']['p_value'])}$)"
          if p.get('fast_smoothed') else '--',
          'sensitivity to the state'),
-        ('CIPS panel unit root', 'slow (control)',
-         'no variation' if p['slow'].get('degenerate')
-         else f"${_fmt(p['slow']['cips'])}$ ($p = {_fmt(p['slow']['p_value'])}$)",
-         f"frozen ({cfg_get(cfg, 'latents.slow_kind', 'const')}), smoothed state"),
     ]
+    if 'slow' in p:
+        rows.append((
+            'CIPS panel unit root', 'slow (control)',
+            'no variation' if p['slow'].get('degenerate')
+            else f"${_fmt(p['slow']['cips'])}$ ($p = {_fmt(p['slow']['p_value'])}$)",
+            f"frozen ({cfg_get(cfg, 'latents.slow_kind', 'const')}), smoothed state"))
     path = os.path.join(out_dir, 'stationarity.tex')
     with open(path, 'w') as f:
         f.write('\\begin{tabular}{llll}\n\\toprule\n')
@@ -827,7 +829,9 @@ def summarise(results, log=print):
             f"{'does not change' if sm['rejects_unit_root'] == p['fast']['rejects_unit_root'] else 'CHANGES'} the verdict")
     ctl = p.get('slow')
     log(f"  control, frozen slow block:            "
-        f"{'reports frozen, as it must' if ctl.get('degenerate') else 'REPORTS MOTION -- the test is measuring itself'}")
+        + ('none -- every dimension is fast' if ctl is None
+           else 'reports frozen, as it must' if ctl.get('degenerate')
+           else 'REPORTS MOTION -- the test is measuring itself'))
     breaks = [b for b in results['breaks'] if b['rejects']]
     log(f"  structural break in the common factor: "
         f"{'yes -- ' + ', '.join(b['break_date'] for b in breaks) if breaks else 'no'}")
@@ -892,7 +896,12 @@ def analyse(df, state_col, sd_col, dt_days, fast, slow, variogram_result,
                                       len(fast) + len(slow), dt_days,
                                       min_bins=min_bins, min_seeds=min_seeds,
                                       log=lambda *a, **k: None)
-    slow_panel = smooth_panel.block(slow)
+    # A homogeneous prior leaves no slow block, and then there is no control to
+    # run: the variogram carries the model-free case on its own.
+    slow_panel = smooth_panel.block(slow) if slow else None
+    if slow_panel is None:
+        log('\n  No slow block -- every dimension is fast, so the frozen '
+            'control is not available.')
 
     results = {'blocks': {'fast': fast, 'slow': slow},
                'dt_days': dt_days,
@@ -903,12 +912,17 @@ def analyse(df, state_col, sd_col, dt_days, fast, slow, variogram_result,
     results['msd_raw'] = msd(fast_panel.Z, dt_days, label='fast, raw', log=log)
     results['msd_demeaned'] = msd(fast_panel.demeaned(), dt_days, log=log,
                                   label='fast, cross-sectionally demeaned')
-    results['msd_slow'] = msd(slow_panel.Z, dt_days, label='slow, control', log=log)
+    if slow_panel is not None:
+        results['msd_slow'] = msd(slow_panel.Z, dt_days, label='slow, control',
+                                  log=log)
 
     log('\n=== 3-4. Panel unit root and stationarity tests ===')
     panel_res = {}
-    for name, blk in (('fast', fast_panel), ('slow', slow_panel),
-                      ('fast_smoothed', smooth_panel.block(fast))):
+    blocks = [('fast', fast_panel)]
+    if slow_panel is not None:
+        blocks.append(('slow', slow_panel))
+    blocks.append(('fast_smoothed', smooth_panel.block(fast)))
+    for name, blk in blocks:
         log(f"  [{name} block]")
         # one dimension at a time; CIPS is defined per series, not per vector
         roots = [panel_unit_root(blk.Z[:, :, k], n_boot=n_boot, log=log)
