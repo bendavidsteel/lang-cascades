@@ -43,6 +43,11 @@ latents:
   causal_state: false            # true = filtered state, which cannot see its own future
   seed: 0
 
+  # Seeds every trial is fitted and scored on, from scripts/flows/pin_seeds.py.
+  # Empty falls back to the posterior-sd rule, which varies with n_fast and
+  # n_dims and so lets a configuration choose the population it is graded on.
+  seed_path: ''
+
   # How much of the stance classifier's output the fit sees. 'hard' is its
   # label; 'soft' its probabilities as expected counts; 'channel' its label
   # through a confusion matrix measured on coded pairs.
@@ -94,5 +99,6 @@ eval_max_pairs: 5000
 # stationarity.py. Read through cfg.get(defaults), so a machine whose
 # config/config.yaml has not caught up still runs without them.
 max_posterior_sd: 0.8        # drop seeds whose state is mostly prior, not data
+min_seed_posts: 1200         # pin_seeds.py floor; sd is high where posts are few
 stationarity_boot: 199       # bootstrap replicates for the panel nulls
 stationarity_windows: 6      # time windows for the mean/variance drift test

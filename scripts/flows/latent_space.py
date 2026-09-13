@@ -282,6 +282,33 @@ def fit_args(cfg, lcfg=None, spec=None):
     return lcfg, spec, kw
 
 
+def keep_seeds(cfg, lcfg, df, sd):
+    """Restrict to the seeds a trial is fitted and scored on.
+
+    A pinned list makes every trial one population. Without one the fallback is
+    the posterior-sd rule, which depends on n_fast and n_dims and so lets a
+    configuration pick the seeds it is graded on.
+    """
+    path = cfg.latents.get('seed_path')
+    if not path:
+        # the fast block is where the motion is, so a seed whose fast dims are
+        # prior rather than measurement contributes the prior's dynamics and
+        # not the data's -- the same filter the stationarity tests apply
+        fast = list(range(min(lcfg.n_fast, lcfg.n_dims)))
+        return drop_prior_dominated(df, sd, fast,
+                                    cfg.get('max_posterior_sd', 0.8),
+                                    log=logger.info)
+
+    pinned = pl.read_parquet(path)['filter_value']
+    out = df.filter(pl.col('filter_value').is_in(pinned))
+    present = out['filter_value'].n_unique()
+    logger.info(f'  pinned seeds: {present} of {len(pinned)} present '
+                f'({path})')
+    if present < 2:
+        raise ValueError(f'{path} and the latent frame share {present} seeds')
+    return out
+
+
 def _gpfa(cfg, spec=None):
     lcfg, spec, kw = fit_args(cfg, spec=spec)
 
@@ -297,13 +324,7 @@ def _gpfa(cfg, spec=None):
             'displacements would be the prior rather than the data. Set '
             'latents.interp_days=0.')
     state = causal if cfg.latents.causal_state else coord
-    # the fast block is where the motion is, so a seed whose fast dims are
-    # prior rather than measurement contributes the prior's dynamics and not
-    # the data's -- the same filter the stationarity tests apply
-    fast = list(range(min(lcfg.n_fast, lcfg.n_dims)))
-    target_df = drop_prior_dominated(
-        build_latents(lcfg, spec, **kw), sd, fast,
-        cfg.get('max_posterior_sd', 0.8), log=logger.info) \
+    target_df = keep_seeds(cfg, lcfg, build_latents(lcfg, spec, **kw), sd) \
         .select(['createtime', 'filter_value', pl.col(state).alias(COORD)]) \
         .sort(['filter_value', 'createtime'])
 
