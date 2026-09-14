@@ -774,6 +774,13 @@ def report_federal_party_centroids(party_info, pairwise_df, n_dims, prefix,
     parties = party_info['parties']
     print(f"Parties (n_users): {dict(zip(parties, party_info['n_per_party'].tolist()))}")
 
+    print("\nCentroids (mean of per-user mean positions):")
+    print(f"  {'party':<20} {'n':>4}  " +
+          '  '.join(f'{prefix}{k+1:<7}' for k in range(n_dims)))
+    for i, party in enumerate(parties):
+        row = '  '.join(f'{party_info["centroids"][i, k]:+8.4f}' for k in range(n_dims))
+        print(f"  {party:<20} {party_info['n_per_party'][i]:>4}  {row}")
+
     print("\nPer-dim spread of FederalParty centroids:")
     for k in range(n_dims):
         print(
