@@ -14,6 +14,7 @@ import os
 
 import hydra
 import numpy as np
+import polars as pl
 
 import latent_space
 from compare_dimensions import _cohens_d, contrast_rows, load_user_means
@@ -22,9 +23,9 @@ logger = logging.getLogger(__name__)
 
 # Rows to show, as (key into contrast_rows, how to name it in the table).
 ROWS = [
-    ('role', 'Role: influencer vs.\\ politician'),
-    ('flank', 'Flank: Con.\\,$+$\\,PPC vs.\\ NDP\\,$+$\\,Green'),
-    ('office_federal_mps', 'Office: Liberal vs.\\ opposition, MPs only'),
+    ('role', 'Influencer vs.\\ politician'),
+    ('flank', 'Con.\\,$+$\\,PPC vs.\\ NDP\\,$+$\\,Green'),
+    ('office_federal_mps', 'Liberal vs.\\ all other MPs'),
 ]
 
 TABLE_END = """    \\bottomrule
@@ -55,7 +56,14 @@ def main(cfg):
     prefix = latent_space.axis_prefix(cfg)
 
     logger.info("Loading per-user mean positions...")
-    rows = contrast_rows(load_user_means(cfg, dim_cols), dim_cols)
+    user_means = load_user_means(cfg, dim_cols)
+    rows = contrast_rows(user_means, dim_cols)
+
+    # the office row reads one side of this against every other, so which
+    # parties are on that other side is what its label is short for
+    logger.info("Members of parliament by federal party:\n%s",
+                user_means.filter(pl.col('SubType') == 'member of parliament')
+                .group_by('FederalParty').len().sort('len', descending=True))
 
     lines = [table_start(n_dims, prefix)]
     for key, label in ROWS:
