@@ -215,6 +215,220 @@ def compare_group_entropy(group_boot, pol_key, inf_key, n_dims):
     )
 
 
+# ------------------------------------------------------------------ spectrum
+#
+# A per-axis variance fraction is a statement about the basis as much as about
+# the group. Under a homogeneous prior the latent is free to rotate, so
+# core.identify fixes the basis post-hoc -- and it whitens, which drives the
+# pooled per-axis fractions to uniform whatever shape the cloud has. The
+# eigenvalues of a group's own covariance survive both.
+
+
+def _concentration(eigvals):
+    """Rotation-invariant concentration summaries of a covariance spectrum.
+
+    lambda1_share is the share of between-user variance a rank-1 model
+    captures, which is what the ideological-constraint literature reports.
+    The other two are effective dimension counts, in dimensions.
+    """
+    lam = np.sort(np.asarray(eigvals, dtype=float))[::-1]
+    total = float(lam.sum())
+    if not np.isfinite(total) or total <= 0:
+        return {k: float('nan') for k in
+                ('lambda1_share', 'participation_ratio', 'entropy', 'exp_h')}
+    p = lam / total
+    pos = p[p > 0]
+    h = float(-np.sum(pos * np.log(pos)))
+    return {
+        'lambda1_share': float(p[0]),
+        'participation_ratio': float(total ** 2 / float((lam ** 2).sum())),
+        'entropy': h,
+        'exp_h': float(np.exp(h)),
+    }
+
+
+# Whether a larger value of a statistic means more concentration. An effective
+# dimension count runs the other way from a variance share.
+CONCENTRATION_SIGN = {'lambda1_share': +1, 'participation_ratio': -1,
+                      'entropy': -1, 'exp_h': -1}
+
+
+def position_spectrum(positions):
+    """Eigenvalues of the between-user covariance of mean positions."""
+    if positions.shape[0] < positions.shape[1] + 2:
+        return np.full(positions.shape[1], np.nan)
+    return np.sort(np.linalg.eigvalsh(np.cov(positions, rowvar=False)))[::-1]
+
+
+def _group_positions(user_means_df, dim_cols, main_type):
+    return user_means_df.filter(pl.col('MainType') == main_type)\
+        .select(dim_cols).to_numpy()
+
+
+def _matched(positions, n, rng, replace=False):
+    idx = rng.choice(positions.shape[0], size=n, replace=replace)
+    return positions[idx]
+
+
+def _matched_stat(positions, n, stat, rng, n_draw, spectrum=None, replace=False):
+    """A concentration statistic measured at a fixed number of users.
+
+    Sample eigenvalues spread apart as the user count falls, so a smaller group
+    looks more concentrated for no reason but its size. Averaging over draws
+    keeps the subsampling from adding noise of its own.
+    """
+    spectrum = position_spectrum if spectrum is None else spectrum
+    vals = [_concentration(spectrum(_matched(positions, n, rng, replace)))[stat]
+            for _ in range(n_draw)]
+    return float(np.nanmean(vals))
+
+
+def report_spectra(user_means_df, dim_cols, main_types):
+    """Each group's position spectrum and its concentration, at matched n."""
+    groups = {mt: _group_positions(user_means_df, dim_cols, mt)
+              for mt in main_types}
+    groups = {mt: p for mt, p in groups.items() if p.shape[0] >= len(dim_cols) + 2}
+    if not groups:
+        return {}
+    n = min(p.shape[0] for p in groups.values())
+    out = {}
+    for mt, pos in groups.items():
+        rng = np.random.default_rng(42)
+        lam = position_spectrum(pos)
+        c = _concentration(lam)
+        out[mt] = dict(c, n_users=pos.shape[0], eigvals=lam, matched_n=n,
+                       lambda1_share_matched=_matched_stat(
+                           pos, n, 'lambda1_share', rng, 200))
+        print(
+            f"  {mt} (n={pos.shape[0]}): eigvals="
+            f"[{', '.join(f'{v:.3f}' for v in lam)}]"
+        )
+        print(
+            f"    lambda1 share={c['lambda1_share']:.4f} "
+            f"(at n={n}: {out[mt]['lambda1_share_matched']:.4f}), "
+            f"participation ratio={c['participation_ratio']:.3f}, "
+            f"exp(H)={c['exp_h']:.3f} of {len(dim_cols)}"
+        )
+    return out
+
+
+def compare_concentration(pol, inf, pol_key, inf_key, spectrum=None, n_dims=None,
+                          stat='lambda1_share', n_draw=25, n_boot=1000,
+                          n_perm=1000, seed=42):
+    """Permutation test and bootstrap CI on a concentration difference.
+
+    Both groups are measured at the same number of users, and the permutation
+    null is built the same way, so the size difference between them cannot
+    show up as a difference in concentration. `spectrum` maps a group's rows to
+    its eigenvalues, so the same test runs on a raw or a noise-corrected one.
+    """
+    spectrum = position_spectrum if spectrum is None else spectrum
+    n_dims = pol.shape[1] if n_dims is None else n_dims
+    if min(pol.shape[0], inf.shape[0]) < n_dims + 2:
+        return None
+    n = min(pol.shape[0], inf.shape[0])
+    rng = np.random.default_rng(seed)
+
+    obs_pol = _matched_stat(pol, n, stat, rng, n_draw, spectrum)
+    obs_inf = _matched_stat(inf, n, stat, rng, n_draw, spectrum)
+    obs = obs_pol - obs_inf
+
+    boot = np.array([
+        _matched_stat(pol, n, stat, rng, 1, spectrum, replace=True) -
+        _matched_stat(inf, n, stat, rng, 1, spectrum, replace=True)
+        for _ in range(n_boot)])
+
+    pool = np.vstack([pol, inf])
+    null = np.empty(n_perm)
+    for b in range(n_perm):
+        idx = rng.permutation(pool.shape[0])
+        null[b] = (_concentration(spectrum(pool[idx[:n]]))[stat] -
+                   _concentration(spectrum(pool[idx[n:2 * n]]))[stat])
+    # +1 so a p-value is never zero on a finite number of shuffles
+    p_perm = (1 + int(np.sum(np.abs(null) >= abs(obs)))) / (n_perm + 1)
+
+    print(f"\n  {stat} at n={n}: {pol_key}={obs_pol:.4f} vs {inf_key}={obs_inf:.4f}")
+    print(
+        f"  diff = {obs:+.4f} "
+        f"(95% bootstrap CI [{np.quantile(boot, 0.025):+.4f}, "
+        f"{np.quantile(boot, 0.975):+.4f}], "
+        f"two-sided permutation p={p_perm:.4g})"
+    )
+    toward = obs * CONCENTRATION_SIGN[stat]
+    print(
+        f"  {pol_key.capitalize()}s "
+        f"{'more' if toward > 0 else 'less'} concentrated than {inf_key}s"
+        f"{'' if p_perm < 0.05 else ', but not distinguishably so'}."
+    )
+    return {'stat': stat, 'matched_n': n, pol_key: obs_pol, inf_key: obs_inf,
+            'diff': obs, 'p_perm': p_perm,
+            'ci_low': float(np.quantile(boot, 0.025)),
+            'ci_high': float(np.quantile(boot, 0.975))}
+
+
+def split_half_positions(rolling_df, dim_cols, min_per_half=10):
+    """Two independent estimates of each user's mean position.
+
+    Alternating observations rather than two blocks of time: a user who drifts
+    would put the drift into the difference between the halves, which is what
+    the correction reads as noise.
+    """
+    halved = rolling_df.sort(['filter_value', 'createtime']).with_columns(
+        (pl.int_range(pl.len()).over('filter_value') % 2).alias('half'))
+    agg = halved.group_by(['filter_value', 'MainType', 'half']).agg(
+        [pl.col(c).mean().alias(c) for c in dim_cols] + [pl.len().alias('n')]
+    ).filter(pl.col('n') >= min_per_half)
+    a = agg.filter(pl.col('half') == 0).drop(['half', 'n'])
+    b = agg.filter(pl.col('half') == 1).drop(['half', 'n', 'MainType'])
+    return a.join(b, on='filter_value', suffix='_b')
+
+
+def noise_corrected_spectrum(a, b):
+    """Signal-covariance eigenvalues, with independent measurement noise removed.
+
+    Each half's error is independent of the other's, so their cross-covariance
+    carries the signal without the noise floor that inflates the low end of a
+    within-half spectrum -- which flattens a spectrum and so hides exactly the
+    concentration being tested for. An eigenvalue near zero can come out
+    negative, which is the estimator being unbiased rather than a failure.
+    """
+    a = a - a.mean(0)
+    b = b - b.mean(0)
+    c = (a.T @ b) / (a.shape[0] - 1)
+    return np.sort(np.linalg.eigvalsh((c + c.T) / 2))[::-1]
+
+
+def halves_spectrum(rows):
+    """noise_corrected_spectrum over rows holding both halves side by side."""
+    k = rows.shape[1] // 2
+    return noise_corrected_spectrum(rows[:, :k], rows[:, k:])
+
+
+def group_halves(half_df, dim_cols, main_type):
+    """One group's two half-estimates, stacked into a single array."""
+    sub = half_df.filter(pl.col('MainType') == main_type)
+    return sub.select(dim_cols + [f'{c}_b' for c in dim_cols]).to_numpy()
+
+
+def report_noise_corrected(half_df, dim_cols, main_types):
+    """Concentration after removing the per-user estimation noise floor."""
+    out = {}
+    for mt in main_types:
+        rows = group_halves(half_df, dim_cols, mt)
+        if rows.shape[0] < len(dim_cols) + 2:
+            continue
+        lam = halves_spectrum(rows)
+        c = _concentration(lam)
+        out[mt] = dict(c, n_users=rows.shape[0], eigvals=lam)
+        print(
+            f"  {mt} (n={rows.shape[0]}): eigvals="
+            f"[{', '.join(f'{v:.3f}' for v in lam)}], "
+            f"lambda1 share={c['lambda1_share']:.4f}, "
+            f"exp(H)={c['exp_h']:.3f} of {len(dim_cols)}"
+        )
+    return out
+
+
 def group_level_position_variance(user_means_df, dim_cols, main_types):
     """Per-MainType variance fractions across per-user mean positions.
 
@@ -653,6 +867,14 @@ def main(cfg):
     logger.info("Group-level position-variance Shannon entropy with user bootstrap...")
     group_boot = group_entropy_bootstrap(main_type_means, dim_cols, main_types)
 
+    print("\n=== Concentration of mean positions (rotation-invariant) ===")
+    if cfg.latents.method == 'gpfa':
+        print("  The per-axis fractions above read the basis core.identify "
+              "chose, which\n  is whitened, so they are near-uniform whatever "
+              "shape a group has. These\n  eigenvalues are the same question "
+              "asked of the group's own covariance.")
+    spectra = report_spectra(main_type_means, dim_cols, main_types)
+
     logger.info(f"Per-user variance fractions per dim (>= {MIN_POINTS_PER_USER} points/user)...")
     per_user_df = per_user_dim_variance(main_type_df, dim_cols, n_dims)
     logger.info(f"Per-user metrics computed for {per_user_df.height} users")
@@ -675,6 +897,21 @@ def main(cfg):
     if pol_key and inf_key:
         compare_pol_vs_inf(per_user_df, pol_key, inf_key, n_dims, prefix)
         compare_group_entropy(group_boot, pol_key, inf_key, n_dims)
+
+        print("\n=== Is one group more uni-dimensional? (matched n) ===")
+        pol_pos = _group_positions(main_type_means, dim_cols, pol_key)
+        inf_pos = _group_positions(main_type_means, dim_cols, inf_key)
+        for stat in ('lambda1_share', 'participation_ratio'):
+            compare_concentration(pol_pos, inf_pos, pol_key, inf_key, stat=stat)
+
+        print("\n=== The same, with the per-user noise floor removed ===")
+        half_df = split_half_positions(main_type_df, dim_cols)
+        report_noise_corrected(half_df, dim_cols, main_types)
+        for stat in ('lambda1_share', 'participation_ratio'):
+            compare_concentration(group_halves(half_df, dim_cols, pol_key),
+                                  group_halves(half_df, dim_cols, inf_key),
+                                  pol_key, inf_key, spectrum=halves_spectrum,
+                                  n_dims=n_dims, stat=stat)
     else:
         logger.warning(
             f"Could not auto-detect political/influencer MainType keys "
