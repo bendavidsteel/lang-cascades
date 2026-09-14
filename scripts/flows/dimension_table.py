@@ -7,17 +7,17 @@ import hydra
 
 import latent_space
 
-NUM_CATS = 3
+NUM_CATS = 5
 
 # the groups describe_dimensions cuts the dimension into, and what to head them
-# with: the quantiles it split on, not a polarity, since the cut is by rank
+# with: the quantiles it split on, not a polarity, since the cut is by rank.
+# The middle band is described but not shown: it is most of the population, so
+# it says what the corpus talks about rather than what the axis means.
 GROUPS = {
     3: ((('negative', '0--5\\%'),
-         ('neutral', '5\\% -- 95\\%'),
          ('positive', '95\\% -- 100\\%'))),
     5: ((('very_negative', '0--1\\%'),
          ('negative', '1\\% -- 10\\%'),
-         ('neutral', '10\\% -- 90\\%'),
          ('positive', '90\\% -- 99\\%'),
          ('very_positive', '99\\% -- 100\\%'))),
 }

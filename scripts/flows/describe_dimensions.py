@@ -30,49 +30,52 @@ def load_text_df(cfg, columns=['id', 'createtime', 'seed', 'Document', 'Targets'
                              .dt.replace_time_zone(None))
     return df
 
-def get_user_documents(df: pl.DataFrame, text_df: pl.DataFrame, pca_feature_df: pl.DataFrame, direction, filter_val_col, n_exemplars=32):
-    pca_feature_df = pca_feature_df.with_columns([
-        pl.col('Target').str.replace('trend_mean_', ''),
-        pl.col('Loading').sign()
-    ])
-    return_df = df.group_by('filter_value')\
-        .agg([
-            pl.col('createtime').min().alias('start_date'),
-            pl.col('createtime').max().alias('end_date')
-        ])\
-        .join_where(
-            text_df.explode(['Targets', 'Stances'])\
-                .rename({'Targets': 'Target', 'Stances': 'Stance'})\
-                .join(pca_feature_df, on='Target', how='inner'),
-                # .with_columns(pl.col('Stance').replace({'NEUTRAL': 0, 'FAVOR': 1, 'AGAINST': -1}).cast(pl.Int32))\
-                # .with_columns((pl.col('Loading') * pl.col('Stance') * direction).alias('product'))\
-                # .filter(((direction == 0) & (pl.col('Stance') == 0)) | ((direction != 0) & (pl.col('product') > 0))),
-                # .drop('Loading', 'Stance', 'product'),
-            (pl.col('filter_value') == pl.col(filter_val_col)) & \
-            (pl.col('start_date') <= pl.col('createtime')) & \
-            (pl.col('end_date') >= pl.col('createtime'))
-        )
-    if len(return_df) < n_exemplars:
-        return_df = df.group_by('filter_value')\
-            .agg([
-                pl.col('createtime').min().alias('start_date'),
-                pl.col('createtime').max().alias('end_date')
-            ])\
-            .join_where(
-                text_df.explode(['Targets', 'Stances'])\
-                    .rename({'Targets': 'Target', 'Stances': 'Stance'}),
-                (pl.col('filter_value') == pl.col(filter_val_col)) & \
-                (pl.col('start_date') <= pl.col('createtime')) & \
-                (pl.col('end_date') >= pl.col('createtime'))
-            )
-    return return_df
+def band_documents(target_df, text_df, pca_feature_df, dim_col, filter_val_col,
+                   n_exemplars):
+    """Every document tagged with where its author stood the day they posted it.
+
+    A trajectory crosses the axis over its life, so a document belongs to the
+    band its author occupied at the time. Pooling everything between a user's
+    first and last visit to a band instead hands the middle band, which every
+    trajectory passes through, nearly the whole corpus.
+    """
+    rows = target_df.select([
+        'filter_value', 'createtime', pl.col(dim_col).alias('band_value')
+    ]).sort('createtime')
+    # the bins are a shared grid, so one spacing covers every trajectory: a
+    # document counts only if a latent observation sits within a bin of it
+    grid = rows.select(pl.col('createtime').unique().sort().diff().median()).item()
+
+    cols = ['id', 'Document', 'createtime', 'filter_value']
+    if 'embedding' in text_df.columns:
+        cols.append('embedding')
+
+    def tag(on_loaded_targets):
+        docs = text_df.explode(['Targets', 'Stances']) \
+            .rename({'Targets': 'Target', 'Stances': 'Stance'})
+        if on_loaded_targets:
+            docs = docs.join(pca_feature_df, on='Target', how='inner')
+        # one row per document: exploding targets would otherwise let a post
+        # that names four loaded targets stand in for four posts
+        return docs.rename({filter_val_col: 'filter_value'}) \
+            .unique(subset=['id']).select(cols).sort('createtime') \
+            .join_asof(rows, on='createtime', by='filter_value',
+                       strategy='nearest', tolerance=grid) \
+            .drop_nulls('band_value')
+
+    tagged = tag(True)
+    # a dimension whose targets are barely posted about leaves too little to
+    # name; fall back to everything its users wrote
+    if tagged.height < 5 * n_exemplars:
+        tagged = tag(False)
+    return tagged
 
 
 def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_features: list, text_df: pl.DataFrame,
                               embedding_model, llm, num_cats=5,
                               n_exemplars=32, n_keyphrases=32,
                               exemplar_selection_method='random', filter_val_col='SeedName',
-                              axis_prefix='PC'):
+                              axis_prefix='PC', seed=42):
     dim_col = f'dim_{dim}'
     pca_feature_df = pl.from_records(dim_pca_features, schema={'Target': pl.String, 'Loading': pl.Float32})
     if num_cats == 5:
@@ -83,23 +86,19 @@ def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_feature
         negative_threshold = target_df.select(pl.col(dim_col).quantile(0.1)).item()
         mean_val = target_df.select(pl.col(dim_col).mean()).item()
 
-        # Filter for positive and negative extremes using polars
-        v_pos_df = target_df.filter(pl.col(dim_col) >= v_pos_threshold)
-        v_neg_df = target_df.filter(pl.col(dim_col) <= v_neg_threshold)
-        pos_df = target_df.filter((pl.col(dim_col) >= positive_threshold) & (pl.col(dim_col) < v_pos_threshold))
-        neg_df = target_df.filter((pl.col(dim_col) <= negative_threshold) & (pl.col(dim_col) > v_neg_threshold))
-        neutral_df = target_df.filter((pl.col(dim_col) < positive_threshold) & (pl.col(dim_col) > negative_threshold))
-
-        # Join with text data to get documents
-        v_pos_text_df = get_user_documents(v_pos_df, text_df, pca_feature_df, 1, filter_val_col, n_exemplars)\
+        # Split the documents by where their author stood when they posted
+        tagged = band_documents(target_df, text_df, pca_feature_df, dim_col,
+                                filter_val_col, n_exemplars)
+        v = pl.col('band_value')
+        v_pos_text_df = tagged.filter(v >= v_pos_threshold)\
             .with_columns(pl.lit(0).alias('Topic'))
-        v_neg_text_df = get_user_documents(v_neg_df, text_df, pca_feature_df, -1, filter_val_col, n_exemplars)\
+        v_neg_text_df = tagged.filter(v <= v_neg_threshold)\
             .with_columns(pl.lit(1).alias('Topic'))
-        pos_text_df = get_user_documents(pos_df, text_df, pca_feature_df, 1, filter_val_col, n_exemplars)\
+        pos_text_df = tagged.filter((v >= positive_threshold) & (v < v_pos_threshold))\
             .with_columns(pl.lit(2).alias('Topic'))
-        neg_text_df = get_user_documents(neg_df, text_df, pca_feature_df, -1, filter_val_col, n_exemplars)\
+        neg_text_df = tagged.filter((v <= negative_threshold) & (v > v_neg_threshold))\
             .with_columns(pl.lit(3).alias('Topic'))
-        neutral_text_df = get_user_documents(neutral_df, text_df, pca_feature_df, 0, filter_val_col, n_exemplars)\
+        neutral_text_df = tagged.filter((v < positive_threshold) & (v > negative_threshold))\
             .with_columns(pl.lit(4).alias('Topic'))
         
         assert min(len(v_pos_text_df), len(v_neg_text_df), len(pos_text_df), len(neg_text_df), len(neutral_text_df)) > n_exemplars, "Insufficient documents in one of the categories to select exemplars from. Consider reducing the number of categories or lowering the percentile thresholds."
@@ -128,17 +127,15 @@ def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_feature
         negative_threshold = target_df.select(pl.col(dim_col).quantile(0.05)).item()
         mean_val = target_df.select(pl.col(dim_col).mean()).item()
 
-        # Filter for positive and negative extremes using polars
-        pos_df = target_df.filter((pl.col(dim_col) >= positive_threshold))
-        neg_df = target_df.filter((pl.col(dim_col) <= negative_threshold))
-        neutral_df = target_df.filter((pl.col(dim_col) < positive_threshold) & (pl.col(dim_col) > negative_threshold))
-
-        # Join with text data to get documents
-        pos_text_df = get_user_documents(pos_df, text_df, pca_feature_df, 1, filter_val_col, n_exemplars)\
+        # Split the documents by where their author stood when they posted
+        tagged = band_documents(target_df, text_df, pca_feature_df, dim_col,
+                                filter_val_col, n_exemplars)
+        v = pl.col('band_value')
+        pos_text_df = tagged.filter(v >= positive_threshold)\
             .with_columns(pl.lit(2).alias('Topic'))
-        neg_text_df = get_user_documents(neg_df, text_df, pca_feature_df, -1, filter_val_col, n_exemplars)\
+        neg_text_df = tagged.filter(v <= negative_threshold)\
             .with_columns(pl.lit(3).alias('Topic'))
-        neutral_text_df = get_user_documents(neutral_df, text_df, pca_feature_df, 0, filter_val_col, n_exemplars)\
+        neutral_text_df = tagged.filter((v < positive_threshold) & (v > negative_threshold))\
             .with_columns(pl.lit(4).alias('Topic'))
         
         assert min(len(pos_text_df), len(neg_text_df), len(neutral_text_df)) > n_exemplars, "Insufficient documents in one of the categories to select exemplars from. Consider reducing the number of categories or lowering the percentile thresholds."
@@ -217,8 +214,14 @@ def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_feature
         method="information_weighted"
     )
 
-    # Select exemplar texts for each topic
-    cluster_exemplars = [topic_df.select(['index', 'Document']).sample(n_exemplars).to_dict(as_series=False) for topic_df in combined_df.with_row_index().partition_by('Topic')]
+    # Select exemplar texts for each topic, in cluster-label order: that is the
+    # order toponymy returns names in, and the labels are read off by position
+    indexed = combined_df if 'index' in combined_df.columns else combined_df.with_row_index()
+    cluster_exemplars = [
+        indexed.filter(pl.col('Topic') == topic).select(['index', 'Document'])
+               .sample(n_exemplars, seed=seed).to_dict(as_series=False)
+        for topic in sorted(set(topics.tolist()))
+    ]
     cluster_layer.exemplars = [exemplar['Document'] for exemplar in cluster_exemplars]
     cluster_layer.exemplar_indices = [exemplar['index'] for exemplar in cluster_exemplars]
 
