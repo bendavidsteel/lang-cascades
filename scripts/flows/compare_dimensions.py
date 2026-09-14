@@ -260,6 +260,162 @@ def incumbency_test(user_means_df, dim_cols, prefix, min_size=MIN_GROUP_SIZE):
           '  '.join(f'{v:>6.3f}' for v in p))
 
 
+def _cohens_d(a, b, n_boot=1000, seed=42):
+    """Separation of two sets of positions per dim, in pooled SDs, with a CI."""
+    rng = np.random.default_rng(seed)
+
+    def d(x, y):
+        n, m = len(x), len(y)
+        pooled = np.sqrt(((n - 1) * x.var(0, ddof=1) + (m - 1) * y.var(0, ddof=1))
+                         / max(n + m - 2, 1))
+        return np.where(pooled > 0, (x.mean(0) - y.mean(0)) / pooled, np.nan)
+
+    draws = np.stack([d(a[rng.integers(len(a), size=len(a))],
+                        b[rng.integers(len(b), size=len(b))])
+                      for _ in range(n_boot)])
+    return d(a, b), *np.percentile(draws, [2.5, 97.5], axis=0)
+
+
+def report_contrasts(rows, dim_cols, prefix):
+    """One line per construct: how far it moves each axis, in pooled SDs.
+
+    Three things the metadata can say about a user -- whether they hold office
+    at all, which side they are on, and whether their side is the one in
+    government -- are separate questions that a single reading of the axes
+    tends to run together. Each row is one of them, and an axis belongs to the
+    row that moves it.
+    """
+    print(f"\n  {'contrast':<44} {'n':>11}  " +
+          '  '.join(f'{prefix}{k + 1:<13}' for k in range(len(dim_cols))))
+    for label, a, b in rows:
+        if len(a) < MIN_GROUP_SIZE or len(b) < MIN_GROUP_SIZE:
+            print(f"  {label:<44} {len(a):>5}/{len(b):<5}  too few users")
+            continue
+        d, lo, hi = _cohens_d(a, b)
+        cells = '  '.join(f'{d[k]:+5.2f} [{lo[k]:+4.1f},{hi[k]:+4.1f}]'
+                          for k in range(len(dim_cols)))
+        print(f"  {label:<44} {len(a):>5}/{len(b):<5}  {cells}")
+
+
+def _positions(df, dim_cols, *predicates):
+    out = df
+    for pred in predicates:
+        out = out.filter(pred)
+    return out.select(dim_cols).to_numpy()
+
+
+def _logit_weights(a, b, n_boot=400, seed=42):
+    """Standardized logistic weights separating two groups, with CIs.
+
+    A contrast read one axis at a time credits every axis that correlates with
+    the label; these credit only what an axis adds once the others are known,
+    which is what says an axis carries a construct rather than borrowing it.
+
+    Ridged, because a contrast the axes separate cleanly sends an unpenalised
+    fit's weights off to wherever the optimiser stops.
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    x = np.vstack([a, b])
+    y = np.r_[np.ones(len(a)), np.zeros(len(b))]
+    mu, sd = x.mean(0), x.std(0)
+    scale = np.where(sd > 0, sd, 1.0)
+
+    def fit(idx):
+        model = LogisticRegression(C=1.0, max_iter=2000)
+        model.fit((x[idx] - mu) / scale, y[idx])
+        return model.coef_[0]
+
+    rng = np.random.default_rng(seed)
+    at, bt = np.arange(len(a)), len(a) + np.arange(len(b))
+    draws = np.stack([fit(np.r_[rng.choice(at, at.size), rng.choice(bt, bt.size)])
+                      for _ in range(n_boot)])
+    return fit(np.arange(len(y))), *np.percentile(draws, [2.5, 97.5], axis=0)
+
+
+def report_unique(rows, dim_cols, prefix):
+    """The same contrasts, each axis credited only for what it alone explains."""
+    print(f"\n  {'contrast':<44} {'n':>11}  " +
+          '  '.join(f'{prefix}{k + 1:<13}' for k in range(len(dim_cols))))
+    for label, a, b in rows:
+        if min(len(a), len(b)) < 5 * len(dim_cols):
+            continue
+        w, lo, hi = _logit_weights(a, b)
+        cells = '  '.join(f'{w[k]:+5.2f} [{lo[k]:+4.1f},{hi[k]:+4.1f}]'
+                          for k in range(len(dim_cols)))
+        print(f"  {label:<44} {len(a):>5}/{len(b):<5}  {cells}")
+
+
+def axis_correlations(user_means_df, dim_cols, prefix, strata):
+    """Correlation between axes across users, overall and inside one role.
+
+    Two axes that both separate governments from oppositions are the same
+    finding twice if users who sit high on one sit high on the other, and two
+    findings if they do not.
+    """
+    for label, predicate in strata:
+        sub = user_means_df if predicate is None else user_means_df.filter(predicate)
+        if sub.height < 2 * len(dim_cols):
+            continue
+        corr = np.corrcoef(sub.select(dim_cols).to_numpy(), rowvar=False)
+        print(f"\n  {label} (n={sub.height}):")
+        print(f"    {'':<6}" + ' '.join(f'{prefix}{k + 1:<6}' for k in range(len(corr))))
+        for k, row in enumerate(corr):
+            print(f"    {prefix}{k + 1:<4}" + ' '.join(f'{v:+7.3f}' for v in row))
+
+
+def construct_contrasts(user_means_df, dim_cols, prefix):
+    """Role, flank and office, each as its own contrast over the same users.
+
+    Office is read twice, once over every partisan and once inside a single
+    elected role. The restricted reading is the one that settles whether an
+    axis separates governments from oppositions or only separates sitting
+    members from the candidates and staff a losing party has more of.
+    """
+    df = user_means_df
+    opposition = ~pl.col('FederalParty').is_in(['Liberal'])
+    mp = pl.col('SubType') == 'member of parliament'
+    mla = pl.col('SubType') == 'member of the provincial legislature'
+    in_gov = pl.col('ProvincialParty').is_in(list(PROVINCIAL_GOVERNMENTS))
+    partisan = pl.col('FederalParty').is_in(
+        ['Liberal', 'Conservative', 'NDP', 'Green', 'Bloc Québécois', 'PPC'])
+    prov = pl.col('ProvincialParty').is_not_null() & (pl.col('ProvincialParty') != '')
+
+    rows = [
+        ('role: influencer vs politician',
+         _positions(df, dim_cols, pl.col('MainType') == 'influencer'),
+         _positions(df, dim_cols, pl.col('MainType') == 'politician')),
+        ('flank: Con+PPC vs NDP+Green, federal',
+         _positions(df, dim_cols, pl.col('FederalParty').is_in(['Conservative', 'PPC'])),
+         _positions(df, dim_cols, pl.col('FederalParty').is_in(['NDP', 'Green']))),
+        ('flank: Con+PPC vs NDP+Green, MPs only',
+         _positions(df, dim_cols, mp, pl.col('FederalParty').is_in(['Conservative', 'PPC'])),
+         _positions(df, dim_cols, mp, pl.col('FederalParty').is_in(['NDP', 'Green']))),
+        ('office: federal Liberal vs rest',
+         _positions(df, dim_cols, partisan, ~opposition),
+         _positions(df, dim_cols, partisan, opposition)),
+        ('office: federal Liberal vs rest, MPs only',
+         _positions(df, dim_cols, mp, partisan, ~opposition),
+         _positions(df, dim_cols, mp, partisan, opposition)),
+        ('office: provincial government vs rest',
+         _positions(df, dim_cols, prov, in_gov),
+         _positions(df, dim_cols, prov, ~in_gov)),
+        ('office: provincial government vs rest, MLAs',
+         _positions(df, dim_cols, mla, prov, in_gov),
+         _positions(df, dim_cols, mla, prov, ~in_gov)),
+    ]
+    report_contrasts(rows, dim_cols, prefix)
+    print("\n  The same contrasts, as standardized logistic weights:")
+    report_unique(rows, dim_cols, prefix)
+    print("\n  Correlation between axes across users:")
+    axis_correlations(user_means_df, dim_cols, prefix, [
+        ('all users', None),
+        ('politicians', pl.col('MainType') == 'politician'),
+        ('members of a provincial legislature', mla & prov),
+        ('members of parliament', mp & partisan),
+    ])
+
+
 def party_contrasts(user_means_df, dim_cols, prefix, min_size=MIN_GROUP_SIZE):
     """Each party against the mean of the others, per axis.
 
@@ -308,7 +464,7 @@ def named_contrasts(parties, centroids, pooled, dim_cols, prefix, contrasts):
 
 # axes whose leading targets overlap enough that a description cannot tell
 # them apart, as (a, b) zero-based indices
-AXIS_PAIRS = [(1, 2)]
+AXIS_PAIRS = [(0, 1), (0, 2), (1, 2)]
 
 CONTRASTS = [
     ('governing vs opposition', ['Liberal'],
@@ -364,6 +520,9 @@ def main(cfg):
                             n_show=40)
 
     incumbency_test(user_means_df, dim_cols, prefix)
+
+    print("\n=== Role, flank and office as separate contrasts ===")
+    construct_contrasts(user_means_df, dim_cols, prefix)
 
 
 if __name__ == '__main__':
