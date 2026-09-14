@@ -822,18 +822,20 @@ def main(cfg):
                     store(LANDSCAPE_CACHE, horizon, losses, baselines,
                           'model_loss', 'baseline_loss')
 
-                if horizon in todo[('ets', scenario)]:
+                # .get, not [], for every optional method: a method left out
+                # of ACTIVE_CACHES has no todo list to consult
+                if horizon in todo.get(('ets', scenario), ()):
                     store('ets', horizon, *compute_ets_losses(
                         rolling_df, horizon, dims, spec, scenario, split_key),
                         loss_key='ets_loss', baseline_key='ets_baseline_loss')
 
-                if horizon in todo[('theta', scenario)]:
+                if horizon in todo.get(('theta', scenario), ()):
                     store('theta', horizon, *compute_theta_losses(
                         rolling_df, horizon, dims, spec, scenario, split_key),
                         loss_key='theta_loss', baseline_key='theta_baseline_loss')
 
                 for kind in ('mean', 'ar1'):
-                    if horizon in todo[(kind, scenario)]:
+                    if horizon in todo.get((kind, scenario), ()):
                         store(kind, horizon, *compute_reversion_losses(
                             rolling_df, horizon, dims, spec, scenario, split_key,
                             kind),
