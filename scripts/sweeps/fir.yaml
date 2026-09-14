@@ -20,7 +20,7 @@
 # the cheap one on that axis.
 #
 #   wandb sweep --project potential_landscape_training scripts/sweeps/fir.yaml
-#   sbatch --export=SWEEP=<entity/project/id>,COUNT=6 gpfa_agent.sh
+#   sbatch --export=SWEEP=<entity/project/id>,COUNT=2 gpfa_agent.sh
 #
 # The per-trial timeout sits below the two-hour wall so a slow trial is killed
 # inside the job, by the job, rather than by SLURM mid-step: a trial SIGKILLed
@@ -43,8 +43,8 @@ command:
   # A trial SIGKILLed by SLURM is charged to the allocation and recorded as
   # crashed, whereas one killed by this is only recorded. Landscape training is
   # minutes now, so the budget is set by the latent fit a cache miss pays for,
-  # and the slack is only ever paid by the trials that need it.
-  - "3000"
+  # and sits under the one-hour wall.
+  - "2400"
   - python
   - ${program}
   - ${args_no_hyphens}
