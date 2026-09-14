@@ -252,32 +252,38 @@ def test_significance(metrics_df, losses_by_key):
 
 
 def benjamini_hochberg(p_values, alpha=0.05):
-    """Apply Benjamini-Hochberg correction. Returns array of booleans."""
+    """Benjamini-Hochberg adjusted p-values, and which of them clear alpha."""
     valid = ~np.isnan(p_values)
-    n = np.sum(valid)
+    n = int(np.sum(valid))
+    adjusted = np.full(len(p_values), np.nan)
+    significant = np.full(len(p_values), False)
     if n == 0:
-        return np.full(len(p_values), False)
+        return adjusted, significant
 
     order = np.argsort(p_values[valid])
     ranks = np.empty_like(order)
     ranks[order] = np.arange(1, n + 1)
 
-    adjusted = p_values.copy()
-    adjusted[valid] = p_values[valid] * n / ranks
-
-    significant = np.full(len(p_values), False)
+    scaled = p_values[valid] * n / ranks
+    # BH steps up from the largest p, so an adjusted value can never sit above
+    # one ranked below it
+    stepped = np.minimum.accumulate(scaled[order][::-1])[::-1]
+    out = np.empty_like(scaled)
+    out[order] = stepped
+    adjusted[valid] = np.minimum(out, 1.0)
     significant[valid] = adjusted[valid] < alpha
-    return significant
+    return adjusted, significant
 
 
-def significance_stars(p):
-    if np.isnan(p):
+def significance_stars(q):
+    """Stars for a BH-adjusted p-value, so the figure claims what BH allows."""
+    if np.isnan(q):
         return ''
-    if p < 0.001:
+    if q < 0.001:
         return '***'
-    if p < 0.01:
+    if q < 0.01:
         return '**'
-    if p < 0.05:
+    if q < 0.05:
         return '*'
     return 'n.s.'
 
@@ -310,7 +316,7 @@ def plot_category_bars(df, category, horizon, fig_dir, losses_by_key):
             ratios = model / np.maximum(baseline, 1e-12)
             summaries.append({
                 'value': r['value'],
-                'p_value': r['p_value'],
+                'q_value': r['q_value'],
                 'n_trajectories': r['n_trajectories'],
                 'center': float(np.median(ratios)),
                 'q3': float(np.quantile(ratios, 0.75)),
@@ -332,7 +338,7 @@ def plot_category_bars(df, category, horizon, fig_dir, losses_by_key):
             whishi = float(in_high.max()) if in_high.size else m_q3
             summaries.append({
                 'value': r['value'],
-                'p_value': r['p_value'],
+                'q_value': r['q_value'],
                 'n_trajectories': r['n_trajectories'],
                 'center': m_med / base_med,
                 'q1': m_q1 / base_med,
@@ -348,7 +354,7 @@ def plot_category_bars(df, category, horizon, fig_dir, losses_by_key):
 
     summaries.sort(key=lambda x: x['center'])
     values = [s['value'] for s in summaries]
-    p_vals = np.array([s['p_value'] for s in summaries])
+    q_vals = np.array([s['q_value'] for s in summaries])
     n_trajs = np.array([s['n_trajectories'] for s in summaries])
 
     n = len(values)
@@ -429,13 +435,14 @@ def plot_category_bars(df, category, horizon, fig_dir, losses_by_key):
     x_range = ax.get_xlim()[1] - ax.get_xlim()[0]
     right_edge = ax.get_xlim()[1]
 
-    for i, (s, p, nt) in enumerate(zip(summaries, p_vals, n_trajs)):
-        stars = significance_stars(p)
+    # In the margin the whisker headroom leaves, in one column rather than
+    # against each box, so the stars read down the figure and never land on a
+    # box that happens to reach the edge.
+    for i, (q, nt) in enumerate(zip(q_vals, n_trajs)):
+        stars = significance_stars(q)
         label = f'{stars}  n={nt}' if stars else f'n={nt}'
-        # Anchor just inside the right edge of the box (q3), clamped to the
-        # visible plot edge for boxes that extend past the upper xlim.
-        x = min(s['q3'], right_edge) - x_range * 0.01
-        # ax.text(x, i, label, va='center', ha='right', fontsize=7)
+        ax.text(right_edge - x_range * 0.01, i, label,
+                va='center', ha='right', fontsize=7)
 
     os.makedirs(fig_dir, exist_ok=True)
     fname = f'eval_breakdown_{category}_{horizon}d.png'
@@ -455,13 +462,18 @@ def main(cfg):
     print("\nRunning significance tests (Wilcoxon signed-rank, BH-corrected)...")
     metrics_df = test_significance(metrics_df, losses_by_key)
 
+    # corrected within a horizon: the subgroups of one figure are the family
+    q_col = np.full(len(metrics_df), np.nan)
     sig_col = np.full(len(metrics_df), False)
     for horizon in metrics_df['horizon'].unique().to_list():
         mask = metrics_df['horizon'].to_numpy() == horizon
         p_vals = metrics_df['p_value'].to_numpy().copy()
         p_vals[~mask] = np.nan
-        sig_col |= benjamini_hochberg(p_vals)
-    metrics_df = metrics_df.with_columns(pl.Series('significant', sig_col))
+        adjusted, significant = benjamini_hochberg(p_vals)
+        q_col[mask] = adjusted[mask]
+        sig_col |= significant
+    metrics_df = metrics_df.with_columns(pl.Series('q_value', q_col),
+                                         pl.Series('significant', sig_col))
 
     for horizon in sorted(metrics_df['horizon'].unique().to_list()):
         print(f"\n=== {horizon}-day horizon ===")
@@ -469,11 +481,11 @@ def main(cfg):
             .filter(pl.col('baseline_mse') > MIN_BASELINE_MSE) \
             .sort(['category', 'ratio'], descending=[False, False])
         for row in h_df.iter_rows(named=True):
-            stars = significance_stars(row['p_value'])
+            stars = significance_stars(row['q_value'])
             print(
                 f"  {row['category']:12s} | {row['value']:40s} | "
                 f"ratio={row['ratio']:.4f} | frac_better={row['frac_better']:.3f} | "
-                f"n_traj={row['n_trajectories']:5d} | {stars}"
+                f"n_traj={row['n_trajectories']:5d} | q={row['q_value']:.4f} | {stars}"
             )
 
     trend_name = os.path.basename(cfg.trend_path.rstrip('/'))
