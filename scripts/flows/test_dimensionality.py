@@ -115,12 +115,16 @@ def per_user_dim_variance(rolling_df, dim_cols, n_dims):
 
 
 def compute_user_means(rolling_df, dim_cols):
-    """One row per user: mean position per latent dim plus metadata fields."""
+    """One row per user: mean position per latent dim plus metadata fields.
+
+    Sorted, because group_by promises no order and the bootstraps downstream
+    draw by row index: without this a rerun resamples different users.
+    """
     return rolling_df.group_by('filter_value').agg(
         [pl.col(c).mean().alias(c) for c in dim_cols] +
         [pl.col(f).first().alias(f) for f in GROUP_FIELDS] +
         [pl.len().alias('n_points')]
-    ).filter(pl.col('n_points') >= MIN_POINTS_PER_USER)
+    ).filter(pl.col('n_points') >= MIN_POINTS_PER_USER).sort('filter_value')
 
 
 def _shannon_entropy(frac):
@@ -380,7 +384,7 @@ def split_half_positions(rolling_df, dim_cols, min_per_half=10):
     ).filter(pl.col('n') >= min_per_half)
     a = agg.filter(pl.col('half') == 0).drop(['half', 'n'])
     b = agg.filter(pl.col('half') == 1).drop(['half', 'n', 'MainType'])
-    return a.join(b, on='filter_value', suffix='_b')
+    return a.join(b, on='filter_value', suffix='_b').sort('filter_value')
 
 
 def noise_corrected_spectrum(a, b):
@@ -455,12 +459,81 @@ def group_level_position_variance(user_means_df, dim_cols, main_types):
     return out
 
 
-def between_group_eta_squared(user_means_df, group_field, dim_cols):
-    """Compute eta^2 (= SS_between / SS_total) per latent dim for one group field.
+def _level_codes(sub, group_field):
+    """Integer code per row, and the level labels those codes index."""
+    levels = sorted(sub[group_field].unique().to_list())
+    code = {lvl: i for i, lvl in enumerate(levels)}
+    return np.array([code[v] for v in sub[group_field].to_list()]), levels
 
-    Each row of user_means_df is one user's mean position in latent space plus
-    metadata fields. Levels with fewer than MIN_GROUP_SIZE users are dropped,
-    and rows with null/empty group label are dropped.
+
+def _strata(codes, n_levels):
+    return [np.flatnonzero(codes == g) for g in range(n_levels)]
+
+
+def _resample(strata, rng):
+    """Row indices for one replicate, holding every level at its own size."""
+    return np.concatenate([rng.choice(s, size=s.size, replace=True) for s in strata])
+
+
+def _column_sums(codes, points, n_levels):
+    return np.stack([np.bincount(codes, weights=points[:, k], minlength=n_levels)
+                     for k in range(points.shape[1])], axis=1)
+
+
+def _variance_shares(codes, points, n_levels):
+    """Between-level share of each dimension's variance: eta^2, and omega^2.
+
+    eta^2 climbs with the number of levels whether or not the labels mean
+    anything, and the fields compared here differ by a factor of ten in level
+    count; omega^2 subtracts the share a partition of that size earns by chance.
+    """
+    n, n_dim = points.shape
+    grand = points.mean(0)
+    ss_total = ((points - grand) ** 2).sum(0)
+    counts = np.bincount(codes, minlength=n_levels).astype(float)
+    nz = counts > 0
+    means = np.zeros((n_levels, n_dim))
+    means[nz] = _column_sums(codes, points, n_levels)[nz] / counts[nz, None]
+    ss_between = (counts[:, None] * (means - grand) ** 2).sum(0)
+
+    df_between, df_within = int(nz.sum()) - 1, n - int(nz.sum())
+    nan = np.full(n_dim, np.nan)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        eta2 = np.where(ss_total > 0, ss_between / ss_total, 0.0)
+        ms_within = (ss_total - ss_between) / df_within if df_within > 0 else nan
+        omega2 = np.where(ss_total + ms_within > 0,
+                          (ss_between - df_between * ms_within) / (ss_total + ms_within),
+                          np.nan)
+        f = np.where(ms_within > 0, (ss_between / df_between) / ms_within, np.nan) \
+            if df_between > 0 else nan
+    return eta2, omega2, f, df_between, df_within
+
+
+def _shares_bootstrap(codes, points, n_levels, n_boot, seed):
+    """Spread of eta^2 per dimension, and how often each dimension carries the most.
+
+    What a reader takes from this table is which dimension a field separates
+    best, so the ranking is what needs an interval; whether any one eta^2 clears
+    zero is not in question at these counts.
+    """
+    rng = np.random.default_rng(seed)
+    strata = _strata(codes, n_levels)
+    draws = np.stack([_variance_shares(codes[s], points[s], n_levels)[0]
+                      for s in (_resample(strata, rng) for _ in range(n_boot))])
+    lo, hi = np.percentile(draws, [2.5, 97.5], axis=0)
+    return {'eta2_lo': lo, 'eta2_hi': hi,
+            'p_argmax': np.bincount(draws.argmax(1),
+                                    minlength=points.shape[1]) / n_boot}
+
+
+def between_group_eta_squared(user_means_df, group_field, dim_cols, n_boot=1000,
+                              seed=42):
+    """Between-level variance share per latent dim for one metadata field.
+
+    Each row of user_means_df is one user's mean position plus metadata. Levels
+    with fewer than MIN_GROUP_SIZE users are dropped, as are rows with a null or
+    empty label. The bootstrap resamples within each level, so level sizes stay
+    fixed and what varies is who stands for each one.
     """
     sub = user_means_df\
         .drop_nulls(group_field)\
@@ -473,45 +546,23 @@ def between_group_eta_squared(user_means_df, group_field, dim_cols):
     keep = level_counts.filter(pl.col('len') >= MIN_GROUP_SIZE)[group_field].to_list()
     if len(keep) < 2:
         return None
-    sub = sub.filter(pl.col(group_field).is_in(keep))
+    sub = sub.filter(pl.col(group_field).is_in(keep)).sort('filter_value')
 
-    n_total = sub.height
-    grand_mean = sub.select(dim_cols).mean().to_numpy()[0]
-
-    group_stats = sub.group_by(group_field).agg(
-        [pl.col(c).mean().alias(f'{c}_gmean') for c in dim_cols] +
-        [pl.len().alias('n')]
-    )
-    n_g = group_stats['n'].to_numpy()
-    g_means = group_stats.select([f'{c}_gmean' for c in dim_cols]).to_numpy()
-
-    ss_between = ((g_means - grand_mean) ** 2 * n_g[:, None]).sum(axis=0)
+    codes, levels = _level_codes(sub, group_field)
     points = sub.select(dim_cols).to_numpy()
-    ss_total = ((points - grand_mean) ** 2).sum(axis=0)
-
-    eta2 = np.where(ss_total > 0, ss_between / ss_total, 0.0)
-
-    f_stats, p_values = [], []
-    n_groups = len(keep)
-    df_between = n_groups - 1
-    df_within = n_total - n_groups
-    for k in range(len(dim_cols)):
-        ss_within = ss_total[k] - ss_between[k]
-        if ss_within <= 0 or df_within <= 0 or df_between <= 0:
-            f_stats.append(float('nan'))
-            p_values.append(float('nan'))
-            continue
-        f = (ss_between[k] / df_between) / (ss_within / df_within)
-        f_stats.append(float(f))
-        p_values.append(float(1 - stats.f.cdf(f, df_between, df_within)))
+    eta2, omega2, f, df_between, df_within = _variance_shares(codes, points, len(levels))
+    with np.errstate(invalid='ignore'):
+        p = np.where(np.isfinite(f), 1 - stats.f.cdf(f, df_between, df_within), np.nan)
 
     return {
         'group_field': group_field,
-        'levels': keep,
-        'n_users': n_total,
+        'levels': levels,
+        'n_users': sub.height,
         'eta2': eta2,
-        'f_stat': np.array(f_stats),
-        'p_value': np.array(p_values),
+        'omega2': omega2,
+        'f_stat': f,
+        'p_value': p,
+        **_shares_bootstrap(codes, points, len(levels), n_boot, seed),
     }
 
 
@@ -523,15 +574,17 @@ def run_between_group_analysis(user_means_df, dim_cols, n_dims):
         if res is None:
             logger.info(f"  {field}: skipped (too few labeled users / levels)")
             continue
-        eta_str = ', '.join(f"d{i}={v:.3f}" for i, v in enumerate(res['eta2']))
-        p_str = ', '.join(f"d{i}={v:.2g}" for i, v in enumerate(res['p_value']))
-        logger.info(
-            f"  {field}: n_users={res['n_users']}, levels={len(res['levels'])}, "
-            f"eta^2 [{eta_str}], p [{p_str}]"
-        )
+        logger.info(f"  {field}: n_users={res['n_users']}, "
+                    f"levels={len(res['levels'])}")
+        for k in range(n_dims):
+            logger.info(
+                f"    d{k}: eta^2={res['eta2'][k]:.3f} "
+                f"[{res['eta2_lo'][k]:.3f}, {res['eta2_hi'][k]:.3f}], "
+                f"omega^2={res['omega2'][k]:.3f}, p={res['p_value'][k]:.2g}, "
+                f"P(largest)={res['p_argmax'][k]:.3f}"
+            )
         results.append(res)
     return results
-
 
 def plot_between_group(results, n_dims, prefix, out_path):
     if not results:
@@ -559,7 +612,44 @@ def plot_between_group(results, n_dims, prefix, out_path):
     plt.close(fig)
 
 
-def federal_party_centroid_analysis(user_means_df, dim_cols, n_dims, min_party_size=MIN_GROUP_SIZE):
+def _party_geometry(codes, points, n_parties):
+    """Per-party centroids and the pooled within-party SD each dim is scaled by."""
+    counts = np.bincount(codes, minlength=n_parties).astype(float)
+    centroids = _column_sums(codes, points, n_parties) / counts[:, None]
+    resid = points - centroids[codes]
+    ss_within = _column_sums(codes, resid ** 2, n_parties).sum(0)
+    return centroids, np.sqrt(ss_within / max(points.shape[0] - n_parties, 1))
+
+
+def _pair_effects(codes, points, n_parties, pairs):
+    """Centroid separation per (pair, dim), raw and in pooled within-party SDs."""
+    centroids, pooled_sd = _party_geometry(codes, points, n_parties)
+    diff = np.stack([centroids[i] - centroids[j] for i, j in pairs])
+    with np.errstate(divide='ignore', invalid='ignore'):
+        return diff, np.where(pooled_sd > 0, diff / pooled_sd, np.nan)
+
+
+def _pair_bootstrap(codes, points, n_parties, pairs, n_boot=1000, seed=42):
+    """Resampling spread of each pair's separation, and how often it is the widest.
+
+    Party sizes here span more than an order of magnitude, so two small parties
+    can top a dimension's ranking on sampling noise alone. P(widest) is what
+    says whether the ordering would survive another sample.
+    """
+    rng = np.random.default_rng(seed)
+    strata = _strata(codes, n_parties)
+    draws = np.stack([_pair_effects(codes[s], points[s], n_parties, pairs)[1]
+                      for s in (_resample(strata, rng) for _ in range(n_boot))])
+    lo, hi = np.percentile(draws, [2.5, 97.5], axis=0)
+    widest = np.abs(draws).argmax(axis=1)
+    p_widest = np.stack([np.bincount(widest[:, k], minlength=len(pairs)) / n_boot
+                         for k in range(points.shape[1])], axis=1)
+    return lo, hi, p_widest
+
+
+def federal_party_centroid_analysis(user_means_df, dim_cols, n_dims,
+                                    min_party_size=MIN_GROUP_SIZE, n_boot=1000,
+                                    seed=42):
     """Per-dim FederalParty centroid spread and pairwise differences.
 
     For each latent dim k:
@@ -567,11 +657,12 @@ def federal_party_centroid_analysis(user_means_df, dim_cols, n_dims, min_party_s
       - centroid_std_k  = SD of centroid_p,k across parties
       - pooled_sd_k     = sqrt of pooled within-party variance on dim k
       - standardized_spread_k = centroid_std_k / pooled_sd_k
-        (between-party SD measured in within-party SD units; comparable across dims)
+        (between-party SD in within-party SD units; comparable across dims)
 
     Pairwise: diff_{p,q,k} = centroid_p,k - centroid_q,k, with Cohen's d using
-    pooled_sd_k. Same dim-level pooled SD for every pair so d-values rank by
-    raw centroid distance per dim.
+    the dim-level pooled SD, so d-values rank by raw centroid distance per dim.
+    Each pair carries a bootstrap interval and the probability it is the widest
+    on its dimension.
     """
     sub = user_means_df\
         .drop_nulls('FederalParty')\
@@ -586,58 +677,49 @@ def federal_party_centroid_analysis(user_means_df, dim_cols, n_dims, min_party_s
     if len(keep) < 2:
         logger.warning(f"Fewer than 2 FederalParty levels with >= {min_party_size} users; skipping")
         return None, None
-    sub = sub.filter(pl.col('FederalParty').is_in(keep))
+    sub = sub.filter(pl.col('FederalParty').is_in(keep))\
+        .sort(['FederalParty', 'filter_value'])
 
-    party_stats = sub.group_by('FederalParty').agg(
-        [pl.col(c).mean().alias(f'{c}_mean') for c in dim_cols] +
-        [pl.col(c).std().alias(f'{c}_std') for c in dim_cols] +
-        [pl.len().alias('n')]
-    ).sort('FederalParty')
-
-    parties = party_stats['FederalParty'].to_list()
-    n_per_party = party_stats['n'].to_numpy()
-    centroids = party_stats.select([f'{c}_mean' for c in dim_cols]).to_numpy()
-    within_sd = party_stats.select([f'{c}_std' for c in dim_cols]).to_numpy()
-    within_sd = np.nan_to_num(within_sd, nan=0.0)
+    codes, parties = _level_codes(sub, 'FederalParty')
+    points = sub.select(dim_cols).to_numpy()
+    n_per_party = np.bincount(codes, minlength=len(parties))
+    centroids, pooled_sd = _party_geometry(codes, points, len(parties))
 
     centroid_std = centroids.std(axis=0, ddof=1)
     centroid_range = centroids.max(axis=0) - centroids.min(axis=0)
-
-    df_within = (n_per_party - 1).astype(float)[:, None]
-    pooled_var = (within_sd ** 2 * df_within).sum(axis=0) / max(df_within.sum(), 1.0)
-    pooled_sd = np.sqrt(pooled_var)
     standardized_spread = np.where(pooled_sd > 0, centroid_std / pooled_sd, np.nan)
 
-    pairwise = []
-    n_parties = len(parties)
-    for i in range(n_parties):
-        for j in range(i + 1, n_parties):
-            diff = centroids[i] - centroids[j]
-            d = np.where(pooled_sd > 0, diff / pooled_sd, np.nan)
-            for k in range(n_dims):
-                pairwise.append({
-                    'party_a': parties[i],
-                    'party_b': parties[j],
-                    'dim': k,
-                    'diff': float(diff[k]),
-                    'abs_diff': float(abs(diff[k])),
-                    'cohens_d': float(d[k]),
-                    'abs_cohens_d': float(abs(d[k])),
-                })
-    pairwise_df = pl.DataFrame(pairwise)
+    pairs = [(i, j) for i in range(len(parties)) for j in range(i + 1, len(parties))]
+    diff, d = _pair_effects(codes, points, len(parties), pairs)
+    d_lo, d_hi, p_widest = _pair_bootstrap(codes, points, len(parties), pairs,
+                                           n_boot, seed)
+
+    pairwise_df = pl.DataFrame([
+        {
+            'party_a': parties[i],
+            'party_b': parties[j],
+            'dim': k,
+            'diff': float(diff[pi, k]),
+            'abs_diff': float(abs(diff[pi, k])),
+            'cohens_d': float(d[pi, k]),
+            'abs_cohens_d': float(abs(d[pi, k])),
+            'd_lo': float(d_lo[pi, k]),
+            'd_hi': float(d_hi[pi, k]),
+            'p_widest': float(p_widest[pi, k]),
+        }
+        for pi, (i, j) in enumerate(pairs) for k in range(n_dims)
+    ])
 
     info = {
         'parties': parties,
         'n_per_party': n_per_party,
         'centroids': centroids,
-        'within_sd': within_sd,
         'pooled_sd': pooled_sd,
         'centroid_std': centroid_std,
         'centroid_range': centroid_range,
         'standardized_spread': standardized_spread,
     }
     return info, pairwise_df
-
 
 def plot_federal_party_centroids(party_info, n_dims, prefix, out_path):
     if party_info is None:
@@ -717,7 +799,9 @@ def report_federal_party_centroids(party_info, pairwise_df, n_dims, prefix,
         for row in top.iter_rows(named=True):
             print(
                 f"    {row['party_a']:<20} - {row['party_b']:<20}: "
-                f"diff={row['diff']:+.3f}, d={row['cohens_d']:+.2f}"
+                f"diff={row['diff']:+.3f}, d={row['cohens_d']:+.2f} "
+                f"[{row['d_lo']:+.2f}, {row['d_hi']:+.2f}], "
+                f"P(widest)={row['p_widest']:.3f}"
             )
 
     print("\nLargest pairwise centroid differences overall (by |Cohen's d|):")
@@ -725,7 +809,9 @@ def report_federal_party_centroids(party_info, pairwise_df, n_dims, prefix,
     for row in overall_top.iter_rows(named=True):
         print(
             f"  {prefix}{row['dim']+1}: {row['party_a']:<20} - {row['party_b']:<20}: "
-            f"diff={row['diff']:+.3f}, d={row['cohens_d']:+.2f}"
+            f"diff={row['diff']:+.3f}, d={row['cohens_d']:+.2f} "
+            f"[{row['d_lo']:+.2f}, {row['d_hi']:+.2f}], "
+            f"P(widest)={row['p_widest']:.3f}"
         )
 
 
@@ -946,6 +1032,10 @@ def main(cfg):
                     'n_levels': len(r['levels']),
                     'dim': k,
                     'eta_squared': float(r['eta2'][k]),
+                    'eta_squared_lo': float(r['eta2_lo'][k]),
+                    'eta_squared_hi': float(r['eta2_hi'][k]),
+                    'omega_squared': float(r['omega2'][k]),
+                    'p_argmax': float(r['p_argmax'][k]),
                     'f_stat': float(r['f_stat'][k]),
                     'p_value': float(r['p_value'][k]),
                 })
