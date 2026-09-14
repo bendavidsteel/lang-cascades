@@ -28,34 +28,30 @@ ROWS = [
 ]
 
 TABLE_END = """    \\bottomrule
-\\end{tabular}}"""
+\\end{tabular}"""
+
+# The dimensions the paper reads. The fit has more, and they carry none of the
+# three contrasts, so a column each would be three columns of noise.
+MAX_DIMS = 3
 
 
 def table_start(n_dims, prefix):
-    """The header, and the column spacing that keeps it inside a text width.
-
-    Grouped, so the narrower spacing ends with the table rather than carrying
-    on into whatever the paper puts next.
-    """
     heads = ' & '.join(f"\\textbf{{{prefix}{k + 1}}}" for k in range(n_dims))
-    return f"""{{\\setlength{{\\tabcolsep}}{{4pt}}
-\\begin{{tabular}}{{l|r|{'c' * n_dims}}}
+    return f"""\\begin{{tabular}}{{l|{'c' * n_dims}}}
 \\toprule
-\\textbf{{Contrast}} & \\textbf{{$n$}} & {heads} \\\\
+\\textbf{{Contrast}} & {heads} \\\\
 \\midrule"""
 
 
-def cell(d, lo, hi, strongest):
-    """One effect size over its interval, the row's largest one in bold."""
-    point = f"\\mathbf{{{d:+.2f}}}" if strongest else f"{d:+.2f}"
-    return (f"\\shortstack{{${point}$ \\\\ "
-            f"{{\\scriptsize $[{lo:+.1f}, {hi:+.1f}]$}}}}")
+def cell(d, strongest):
+    """One effect size, the row's largest one in bold."""
+    return f"$\\mathbf{{{d:+.2f}}}$" if strongest else f"${d:+.2f}$"
 
 
 @hydra.main(version_base=None, config_path="../../config", config_name="config")
 def main(cfg):
-    n_dims = cfg.n_dims
-    dim_cols = [f'x0_{i}' for i in range(n_dims)]
+    dim_cols = [f'x0_{i}' for i in range(cfg.n_dims)]
+    n_dims = min(cfg.n_dims, MAX_DIMS)
     prefix = latent_space.axis_prefix(cfg)
 
     logger.info("Loading per-user mean positions...")
@@ -65,12 +61,16 @@ def main(cfg):
     for key, label in ROWS:
         _, a, b = rows[key]
         d, lo, hi = _cohens_d(a, b)
+        # ranked over every dimension, so the bold is not the largest of three
+        # when a dimension the table leaves out carries the contrast
         strongest = int(np.nanargmax(np.abs(d)))
-        cells = ' & '.join(cell(d[k], lo[k], hi[k], k == strongest)
-                           for k in range(n_dims))
-        lines.append(f"    {label} & {len(a)}/{len(b)} & {cells} \\\\")
-        logger.info(f"{label}: n={len(a)}/{len(b)}, "
-                    f"d={np.array2string(d, precision=2, sign='+')}")
+        cells = ' & '.join(cell(d[k], k == strongest) for k in range(n_dims))
+        lines.append(f"    {label} & {cells} \\\\")
+        logger.info(
+            f"{label}: n={len(a)}/{len(b)}, "
+            f"d={np.array2string(d, precision=2, sign='+')}, "
+            f"CI lo={np.array2string(lo, precision=2, sign='+')}, "
+            f"hi={np.array2string(hi, precision=2, sign='+')}")
     lines.append(TABLE_END)
 
     os.makedirs('out', exist_ok=True)
