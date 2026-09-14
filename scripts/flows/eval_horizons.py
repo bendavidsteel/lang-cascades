@@ -134,10 +134,10 @@ CACHE_STYLE = {
 #                       IQR bars; baseline plotted separately as above.
 PLOT_AGGREGATOR = 'median_ratio'
 ABSOLUTE_AGGREGATORS = ('absolute_mean', 'absolute_median')
-# Which pairs the landscape is scored on. 'shared' is exactly the pairs ETS and
-# Theta could be fitted on, so every line in a panel comes from one pair set and
-# the comparison is a true head-to-head; 'full' is every pair in the cell, which
-# is the population estimate but not comparable to the baselines. Absolute mode
+# Which pairs the landscape is scored on. 'shared' is exactly the pairs the
+# local methods could be fitted on, so every line in a panel comes from one pair
+# set and the comparison is a true head-to-head; 'full' is every pair in the
+# cell, which is the population estimate but not comparable to the baselines. Absolute mode
 # needs 'shared' for the three no-movement lines to coincide.
 LANDSCAPE_POOL = 'shared'
 LANDSCAPE_CACHE = 'model' if (LANDSCAPE_POOL == 'full'
@@ -145,8 +145,14 @@ LANDSCAPE_CACHE = 'model' if (LANDSCAPE_POOL == 'full'
     else 'model_shared'
 # The other landscape cache is neither computed nor plotted -- scoring a cell
 # twice costs a forward pass per pair for a number nothing reads.
+#
+# Two comparisons, one of each kind: Theta extrapolates a damped trend, AR(1)
+# reverts toward the training mean. Holt's damped trend is the same idea as
+# Theta's and the training mean is the no-movement line with a worse constant,
+# so a panel carrying all four spends its ink on the distinction it is not
+# making. Their caches stay on disk; naming one here plots it again.
 ACTIVE_CACHES = tuple(c for c in CACHES
-                      if c[0] in (LANDSCAPE_CACHE, 'ets', 'theta', 'mean', 'ar1'))
+                      if c[0] in (LANDSCAPE_CACHE, 'theta', 'ar1'))
 BOOTSTRAP_N = 1000
 BOOTSTRAP_SEED = 0
 BOOTSTRAP_CI_LO = 0.025
