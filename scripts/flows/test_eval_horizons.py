@@ -133,10 +133,74 @@ def test_sample_is_deterministic():
     dim_cols = [f'x0_{d}' for d in DIMS]
     first, second = (eh._select_horizon_pairs(
         rolling_df, HORIZON, dim_cols, SPEC, 'test_out', None,
-        50, eh.ETS_SAMPLE_SEED, 0.25, DIMS)[0] for _ in range(2))
+        50, eh.ETS_SAMPLE_SEED, eh.TOLERANCE_FRAC, DIMS)[0] for _ in range(2))
     assert [(s['filter_value'], s['idx_t0']) for s in first] \
         == [(s['filter_value'], s['idx_t0']) for s in second]
+    assert first == sorted(first, key=lambda s: (s['filter_value'], s['idx_t0'])), \
+        'the pool must come back in one canonical order for the caches to align'
     print(f'pair sample of {len(first)} is stable across calls')
+
+
+def test_history_floor_scales_with_the_horizon():
+    """No pair is asked to extrapolate further than it has been allowed to see."""
+    rolling_df = make_rolling()
+    dim_cols = [f'x0_{d}' for d in DIMS]
+    spacing = eh.median_spacing_days(rolling_df)
+    for horizon in (14, 60, 240):
+        shift_n = eh.horizon_shift(horizon, spacing)
+        assert eh.min_history(shift_n) >= shift_n
+        specs, _ = eh._select_horizon_pairs(
+            rolling_df, horizon, dim_cols, SPEC, 'test_out', None,
+            50, eh.ETS_SAMPLE_SEED, eh.TOLERANCE_FRAC, DIMS)
+        assert specs, f'{horizon}d left no pairs'
+        assert min(s['idx_t0'] for s in specs) >= shift_n - 1, horizon
+        print(f'  {horizon}d: shift_n={shift_n}, history >= '
+              f'{eh.min_history(shift_n)} points')
+
+
+def test_unreachable_horizons_are_dropped():
+    """A horizon below the observation spacing rounds to a shift outside its
+    own tolerance window, so it can never produce a pair."""
+    assert eh.usable_horizons([7, 240], spacing_days=16.0) == [240]
+    assert eh.usable_horizons([7, 240], spacing_days=2.0) == [7, 240]
+    print('7d is dropped at 16d spacing and kept at 2d spacing')
+
+
+def test_reversion_baselines_beat_persistence_on_an_ou_process():
+    """The mean and AR(1) baselines revert, which is what ETS and Theta cannot
+    do -- on a known OU process the shrinkage must beat no-movement, and the
+    unconditional mean must not."""
+    rolling_df = make_rolling()
+    mu, alpha = eh.fit_reversion(rolling_df, HORIZON, DIMS, SPEC, None)
+    assert np.all((alpha > 0) & (alpha < 1)), alpha
+
+    ets, no_movement = eh.compute_ets_losses(
+        rolling_df, HORIZON, DIMS, SPEC, 'test_out', None, n_pairs=40)
+    got = {}
+    for kind in ('mean', 'ar1'):
+        losses, baseline = eh.compute_reversion_losses(
+            rolling_df, HORIZON, DIMS, SPEC, 'test_out', None, kind, n_pairs=40)
+        assert np.array_equal(baseline, no_movement), kind
+        got[kind] = losses.mean()
+    assert got['ar1'] < no_movement.mean(), got
+    assert got['ar1'] < got['mean'], got
+    assert got['mean'] > no_movement.mean(), got
+    print(f"  alpha={np.array2string(alpha, precision=3)} ar1={got['ar1']:.5f} "
+          f"mean={got['mean']:.5f} no-movement={no_movement.mean():.5f} "
+          f"ets={ets.mean():.5f}")
+
+
+def test_stale_cache_rows_are_ignored():
+    """Rows from another configuration must not be plotted beside fresh ones."""
+    import tempfile
+    cache = {}
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'pairs.parquet.zstd')
+        eh._store(cache, path, 60, 'ets', [1.0, 2.0], [3.0, 4.0],
+                  'ets_loss', 'ets_baseline_loss', 'fp-old', 64.0)
+        assert set(eh._load_pair_cache(path, eh.ETS_PAIR_COLS, 'fp-old')) == {60}
+        assert eh._load_pair_cache(path, eh.ETS_PAIR_COLS, 'fp-new') == {}
+    print('a cache written under one fingerprint is invisible under another')
 
 
 if __name__ == '__main__':
@@ -144,6 +208,10 @@ if __name__ == '__main__':
                test_cells_are_populated_and_disjoint,
                test_leakage_check_fires_on_the_wrong_split,
                test_baselines_share_one_pair_set_per_scenario,
-               test_sample_is_deterministic):
+               test_sample_is_deterministic,
+               test_history_floor_scales_with_the_horizon,
+               test_unreachable_horizons_are_dropped,
+               test_reversion_baselines_beat_persistence_on_an_ou_process,
+               test_stale_cache_rows_are_ignored):
         fn()
     print('\nall horizon-evaluation checks passed')
