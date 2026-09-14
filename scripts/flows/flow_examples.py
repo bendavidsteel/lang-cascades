@@ -580,7 +580,7 @@ def print_analysis_results(results: dict, title: str = None):
 def write_latex_table(results: dict, output_path: str):
     """Write stance change results as a LaTeX table.
 
-    Columns: Dim., End, Percentile, Target, FAVOR, NEUTRAL, AGAINST. The first
+    Columns: Dim., Dir., Percentile, Target, FAVOR, NEUTRAL, AGAINST. The first
     three name one group of movers and are printed on its first row only, so a
     group reads as a block rather than repeating its own label down the page.
     """
@@ -610,7 +610,7 @@ def write_latex_table(results: dict, output_path: str):
                         rows.append({
                             'group': (dim_name, period_key, direction, pct_num),
                             'dim': dim_name,
-                            'end': dir_label,
+                            'dir': dir_label,
                             'percentile': pct_label,
                             'target': target,
                             'changes': change_vals,
@@ -622,14 +622,14 @@ def write_latex_table(results: dict, output_path: str):
     lines = []
     lines.append("\\begin{tabular}{llllrrr}")
     lines.append("\\toprule")
-    lines.append("Dim. & End & Percentile & Target & Favor & Neutral & Against \\\\")
+    lines.append("Dim. & Dir. & Percentile & Target & Favor & Neutral & Against \\\\")
     lines.append("\\midrule")
     prev_group = None
     for row in rows:
         opens_group = row['group'] != prev_group
         if prev_group is not None and opens_group:
             lines.append("\\midrule")
-        head = ((row['dim'], row['end'], row['percentile']) if opens_group
+        head = ((row['dim'], row['dir'], row['percentile']) if opens_group
                 else ('', '', ''))
         prev_group = row['group']
         vals = []
