@@ -94,7 +94,17 @@ def dimension_labels_path(cfg):
     per method.
     """
     if cfg.latents.method == 'gpfa':
-        return os.path.join(latent_dir(cfg), 'dimension_labels.json')
+        path = os.path.join(latent_dir(cfg), 'dimension_labels.json')
+        # a projection holds the reference fit's W and b, so its axes are the
+        # same axes and carry the same names; describing it again would only
+        # rediscover them
+        lcfg = LatentConfig.from_cfg(cfg)
+        ref = reference(lcfg)
+        if ref is not None and not os.path.exists(path):
+            ref_dir = fit_dir(latent_root(cfg), ref, splits.SplitSpec.from_cfg(cfg))
+            if ref_dir is not None:
+                return os.path.join(ref_dir, 'dimension_labels.json')
+        return path
     return os.path.join(cfg.trend_path, f'{name(cfg)}_dimension_labels.json')
 
 

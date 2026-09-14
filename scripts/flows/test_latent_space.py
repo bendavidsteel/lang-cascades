@@ -1,3 +1,5 @@
+import os
+
 import numpy as np
 from omegaconf import OmegaConf
 
@@ -80,3 +82,37 @@ def test_two_gpfa_fits_do_not_share_one_dimension_labels_file(tmp_path):
 def test_a_precomputed_method_keeps_its_labels_under_the_trend():
     got = latent_space.dimension_labels_path(_cfg(method='ppca'))
     assert got == './trend/ppca_dimension_labels.json'
+
+
+def test_a_projection_is_captioned_by_the_fit_it_borrows_its_axes_from(tmp_path):
+    ref_cells = tmp_path / 'cells.parquet.zstd'
+    ref_cells.write_bytes(b'cells')
+    handles = tmp_path / 'handle_cells.parquet.zstd'
+    handles.write_bytes(b'handles')
+
+    pooled = _cfg(cells_path=str(ref_cells))
+    projected = _cfg(cells_path=str(handles), ref_cells_path=str(ref_cells),
+                     traj_col='PlatformHandleID')
+    pooled.out_dir = projected.out_dir = str(tmp_path)
+
+    # the projection holds the pooled fit's W and b, so until it is described
+    # in its own right the pooled fit's names are its names
+    assert (latent_space.dimension_labels_path(projected)
+            == latent_space.dimension_labels_path(pooled))
+
+
+def test_a_projection_described_in_its_own_right_keeps_its_own_labels(tmp_path):
+    ref_cells = tmp_path / 'cells.parquet.zstd'
+    ref_cells.write_bytes(b'cells')
+    handles = tmp_path / 'handle_cells.parquet.zstd'
+    handles.write_bytes(b'handles')
+
+    projected = _cfg(cells_path=str(handles), ref_cells_path=str(ref_cells),
+                     traj_col='PlatformHandleID')
+    projected.out_dir = str(tmp_path)
+    own = latent_space.dimension_labels_path(projected)
+    os.makedirs(os.path.dirname(own), exist_ok=True)
+    with open(own, 'w') as f:
+        f.write('{}')
+
+    assert latent_space.dimension_labels_path(projected) == own
