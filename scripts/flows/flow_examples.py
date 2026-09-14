@@ -578,7 +578,12 @@ def print_analysis_results(results: dict, title: str = None):
                         print(f"    No significant stance changes")
 
 def write_latex_table(results: dict, output_path: str):
-    """Write stance change results as a LaTeX table with columns: Percentile, Target, FAVOR, NEUTRAL, AGAINST."""
+    """Write stance change results as a LaTeX table.
+
+    Columns: Dim., End, Percentile, Target, FAVOR, NEUTRAL, AGAINST. The first
+    three name one group of movers and are printed on its first row only, so a
+    group reads as a block rather than repeating its own label down the page.
+    """
     rows = []
     for dim_name, dim_data in results.items():
         for period_key, year_data in sorted(dim_data.items()):
@@ -592,14 +597,10 @@ def write_latex_table(results: dict, output_path: str):
                         continue
 
                     pct_num = int(key.replace(f'{direction}_top_', '').replace('pct', ''))
-                    if direction == 'negative':
-                        pct_label = f"$<{pct_num}$\\%"
-                    else:
-                        pct_label = f"$>{100 - pct_num}$\\%"
-                    if period_key == 'all_time':
-                        pct_col = f"{dim_name} {pct_label}"
-                    else:
-                        pct_col = f"{dim_name} {period_key} {pct_label}"
+                    # the end of the axis is its own column, so the percentile
+                    # is the size of the group rather than a threshold whose
+                    # direction the reader has to infer from < or >
+                    pct_label = f"Top {pct_num}\\%"
 
                     stance_changes = pct_data.get('stance_changes', {})
                     for target, target_data in stance_changes.items():
@@ -607,7 +608,10 @@ def write_latex_table(results: dict, output_path: str):
                         for stance, change_data in target_data['stance_changes'].items():
                             change_vals[stance] = (change_data['early_pct'], change_data['late_pct'])
                         rows.append({
-                            'percentile': pct_col,
+                            'group': (dim_name, period_key, direction, pct_num),
+                            'dim': dim_name,
+                            'end': dir_label,
+                            'percentile': pct_label,
                             'target': target,
                             'changes': change_vals,
                         })
@@ -616,22 +620,26 @@ def write_latex_table(results: dict, output_path: str):
         return
 
     lines = []
-    lines.append("\\begin{tabular}{llrrr}")
+    lines.append("\\begin{tabular}{llllrrr}")
     lines.append("\\toprule")
-    lines.append("Percentile & Target & Favor & Neutral & Against \\\\")
+    lines.append("Dim. & End & Percentile & Target & Favor & Neutral & Against \\\\")
     lines.append("\\midrule")
-    prev_percentile = None
+    prev_group = None
     for row in rows:
-        if prev_percentile is not None and row['percentile'] != prev_percentile:
+        opens_group = row['group'] != prev_group
+        if prev_group is not None and opens_group:
             lines.append("\\midrule")
-        prev_percentile = row['percentile']
+        head = ((row['dim'], row['end'], row['percentile']) if opens_group
+                else ('', '', ''))
+        prev_group = row['group']
         vals = []
         for stance in STANCE_ORDER:
             early_pct, late_pct = row['changes'].get(stance, (0, 0))
             val = f"{early_pct:.1f}→{late_pct:.1f}"
             vals.append(val)
         target_escaped = row['target'].replace('_', '\\_').replace('&', '\\&')
-        lines.append(f"{row['percentile']} & {target_escaped} & {vals[0]} & {vals[1]} & {vals[2]} \\\\")
+        lines.append(f"{head[0]} & {head[1]} & {head[2]} & {target_escaped} & "
+                     f"{vals[0]} & {vals[1]} & {vals[2]} \\\\")
     lines.append("\\bottomrule")
     lines.append("\\end{tabular}")
 
