@@ -102,3 +102,7 @@ max_posterior_sd: 0.8        # drop seeds whose state is mostly prior, not data
 min_seed_posts: 1200         # pin_seeds.py floor; sd is high where posts are few
 stationarity_boot: 199       # bootstrap replicates for the panel nulls
 stationarity_windows: 6      # time windows for the mean/variance drift test
+
+# dimension_table.py. A Prior column earns its width only where the dimensions
+# carry different priors; a homogeneous fit repeats one value down the column.
+dimension_table_prior: false

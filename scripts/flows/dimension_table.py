@@ -35,15 +35,20 @@ def format_prior(kind, tau):
     return f"{names.get(kind, kind)}, $\\tau$={tau:.0f}\\,d"
 
 
-def table_start(groups):
+def table_start(groups, show_prior):
     """The header, widened to however many groups a dimension is cut into."""
     n = len(groups)
     heads = ' & '.join(f"\\textbf{{{h}}}" for _, h in groups)
-    return f"""\\begin{{tabularx}}{{\\textwidth}}{{c|c|c|X|{'X' * n}}}
+    lead = ['\\textbf{Dim.}']
+    if show_prior:
+        lead.append('\\textbf{Prior}')
+    lead += ['\\textbf{Var.}', '\\textbf{Targets}']
+    first = len(lead) + 1
+    return f"""\\begin{{tabularx}}{{\\textwidth}}{{{'c|' * (len(lead) - 1)}X|{'X' * n}}}
 \\toprule
-& & & & \\multicolumn{{{n}}}{{c}}{{\\textbf{{Description}}}} \\\\
-\\cmidrule(lr){{5-{4 + n}}}
-\\textbf{{Dim.}} & \\textbf{{Prior}} & \\textbf{{Var.}} & \\textbf{{Targets}} & {heads} \\\\
+{'& ' * len(lead)}\\multicolumn{{{n}}}{{c}}{{\\textbf{{Description}}}} \\\\
+\\cmidrule(lr){{{first}-{first - 1 + n}}}
+{' & '.join(lead)} & {heads} \\\\
 \\midrule"""
 
 
@@ -57,12 +62,15 @@ def main(cfg):
         dimension_labels = json.load(f)
 
     groups = GROUPS[NUM_CATS]
+    # a homogeneous fit gives every dimension the same prior, and a column of
+    # one repeated value is width the descriptions can use
+    show_prior = bool(cfg.get('dimension_table_prior', False))
 
     # the index is a name, not a rank: a gpfa fit does not order its axes
     priors = latent_space.dimension_priors(cfg)
     shares = latent_space.dimension_variance_share(cfg)
 
-    table_lines = [table_start(groups)]
+    table_lines = [table_start(groups, show_prior)]
 
     max_dim = 5
     for dim_idx in sorted([int(i) for i in dimension_labels.keys()]):
@@ -72,9 +80,11 @@ def main(cfg):
 
         text_labels = [labels[key].replace('&', '\\&') for key, _ in groups]
 
-        kind, tau = priors[dim_idx]
         share = '--' if shares is None else f"{100 * shares[dim_idx]:.0f}\\%"
-        line = f"       {dim_idx+1} & {format_prior(kind, tau)} & {share} & "
+        line = f"       {dim_idx+1} & "
+        if show_prior:
+            line += f"{format_prior(*priors[dim_idx])} & "
+        line += f"{share} & "
         # drop the axis name the label opens with, however long it is
         top_targets = labels['top_features'].partition('(')[2].split(', ')[:4]
         top_targets = [t.replace('&', '\\&') for t in top_targets]
