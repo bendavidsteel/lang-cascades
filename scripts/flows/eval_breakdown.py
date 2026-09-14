@@ -422,10 +422,10 @@ def plot_category_bars(df, category, horizon, fig_dir, losses_by_key):
     ax.set_xlabel(xlabel, fontsize=8)
 
     span = max(bulk_hi - bulk_lo, 1e-6)
-    # Hard-cap the upper limit at 1.3 to focus on the no-skill region; bars or
-    # whiskers extending past that are visually clipped.
-    # ax.set_xlim(max(bulk_lo - span * 0.05, 0.0), min(bulk_hi + span * 0.35, 1.3))
-    ax.set_xlim(right=5)
+    # Both edges follow the whiskers, so nothing is clipped whatever the
+    # subgroups turn out to span. bulk_lo/bulk_hi already bracket 1.0, which
+    # keeps the no-movement line in frame.
+    ax.set_xlim(max(bulk_lo - span * 0.05, 0.0), bulk_hi + span * 0.35)
     x_range = ax.get_xlim()[1] - ax.get_xlim()[0]
     right_edge = ax.get_xlim()[1]
 
