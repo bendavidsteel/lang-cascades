@@ -24,7 +24,7 @@ HORIZON_DAYS = [7, 14, 30, 60, 120, 240, 360, 720]
 # distinct ways of being held out from it. train_in itself is not reported: it
 # is the fit, not a result.
 SCENARIOS = (
-    ('test_in', 'Interpolation', 'unseen trajectories, seen time'),
+    ('test_in', 'Impute', 'unseen trajectories, seen time'),
     ('train_out', 'Forecast', 'seen trajectories, unseen time'),
     ('test_out', 'Zero-shot forecast', 'unseen trajectories, unseen time'),
 )

@@ -18,7 +18,7 @@ evaluation a forecast at every origin rather than only at the last one.
 Crossing the two gives the scenarios the evaluation reports separately:
 
     train x in    trajectory seen, time seen     -- training data
-    val/test x in trajectory unseen, time seen   -- interpolation
+    val/test x in trajectory unseen, time seen   -- imputation
     train x out   trajectory seen, time unseen   -- forecast
     val/test x out both unseen                   -- the real generalisation test
 

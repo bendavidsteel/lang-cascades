@@ -63,7 +63,7 @@ def cell(rolling_df, scenario):
 
 
 def test_reported_scenarios_are_the_three_held_out_cells():
-    """The figure reports interpolation, forecast and zero-shot forecast."""
+    """The figure reports imputation, forecast and zero-shot forecast."""
     assert [s for s, _, _ in eh.SCENARIOS] == ['test_in', 'train_out', 'test_out']
     for scenario, _, _ in eh.SCENARIOS:
         traj, time = scenario.rsplit('_', 1)
