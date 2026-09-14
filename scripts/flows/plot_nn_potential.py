@@ -216,21 +216,24 @@ def setup_y_axis_labels(ax, components, feature_names, dim_2=1, weights=None,
     ax.set_ylabel(y_label, fontsize=8)
     
 
-# Streamplot linewidth scaling parameters (log10-based so weak flows remain visible).
 MIN_LW = 0.3
 MAX_LW = 3.0
 LOG_DECADES = 3
+# How flow magnitude becomes streamline width. 'log' spreads LOG_DECADES
+# orders of magnitude over the width range, so a field whose flow spans
+# decades still shows its weak regions; 'linear' is proportional to the
+# magnitude, which reads the strong regions more faithfully and collapses
+# everything below a tenth of the maximum onto the floor.
+LINEWIDTH_SCALE = 'log'
 
 
 def flow_to_linewidth(flow_magnitude, max_val):
-    """Map flow magnitude to streamplot linewidth via log10 scaling with a floor.
-
-    Linewidths are linearly spaced in log10(flow) over LOG_DECADES orders of
-    magnitude below ``max_val``; anything smaller is clipped to MIN_LW so weak
-    flows remain visible.
-    """
+    """Map flow magnitude to streamplot linewidth, with a floor at MIN_LW."""
     if max_val <= 0:
         return np.full_like(flow_magnitude, 0.5 * (MIN_LW + MAX_LW))
+    if LINEWIDTH_SCALE == 'linear':
+        frac = np.clip(flow_magnitude / max_val, 0.0, 1.0)
+        return MIN_LW + (MAX_LW - MIN_LW) * frac
     log_max_v = np.log10(max_val)
     log_min_v = log_max_v - LOG_DECADES
     log_range = log_max_v - log_min_v
@@ -242,11 +245,13 @@ def linewidth_to_flow(lw, max_val):
     """Inverse of flow_to_linewidth — used to label legend entries."""
     if max_val <= 0:
         return 0.0
+    frac = (lw - MIN_LW) / (MAX_LW - MIN_LW)
+    if LINEWIDTH_SCALE == 'linear':
+        return frac * max_val
     log_max_v = np.log10(max_val)
     log_min_v = log_max_v - LOG_DECADES
     log_range = log_max_v - log_min_v
-    log_flow = log_min_v + (lw - MIN_LW) / (MAX_LW - MIN_LW) * log_range
-    return 10 ** log_flow
+    return 10 ** (log_min_v + frac * log_range)
 
 
 def build_legend_elements(flow_percentiles=None, show_hatching=True):
