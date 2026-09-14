@@ -364,7 +364,7 @@ def axis_correlations(user_means_df, dim_cols, prefix, strata):
             print(f"    {prefix}{k + 1:<4}" + ' '.join(f'{v:+7.3f}' for v in row))
 
 
-def construct_contrasts(user_means_df, dim_cols, prefix):
+def contrast_rows(user_means_df, dim_cols):
     """Role, flank and office, each as its own contrast over the same users.
 
     Office is read twice, once over every partisan and once inside a single
@@ -373,7 +373,9 @@ def construct_contrasts(user_means_df, dim_cols, prefix):
     members from the candidates and staff a losing party has more of.
     """
     df = user_means_df
-    opposition = ~pl.col('FederalParty').is_in(['Liberal'])
+    liberal = pl.col('FederalParty') == 'Liberal'
+    right = pl.col('FederalParty').is_in(['Conservative', 'PPC'])
+    left = pl.col('FederalParty').is_in(['NDP', 'Green'])
     mp = pl.col('SubType') == 'member of parliament'
     mla = pl.col('SubType') == 'member of the provincial legislature'
     in_gov = pl.col('ProvincialParty').is_in(list(PROVINCIAL_GOVERNMENTS))
@@ -381,38 +383,39 @@ def construct_contrasts(user_means_df, dim_cols, prefix):
         ['Liberal', 'Conservative', 'NDP', 'Green', 'Bloc Québécois', 'PPC'])
     prov = pl.col('ProvincialParty').is_not_null() & (pl.col('ProvincialParty') != '')
 
-    rows = [
-        ('role: influencer vs politician',
-         _positions(df, dim_cols, pl.col('MainType') == 'influencer'),
-         _positions(df, dim_cols, pl.col('MainType') == 'politician')),
-        ('flank: Con+PPC vs NDP+Green, federal',
-         _positions(df, dim_cols, pl.col('FederalParty').is_in(['Conservative', 'PPC'])),
-         _positions(df, dim_cols, pl.col('FederalParty').is_in(['NDP', 'Green']))),
-        ('flank: Con+PPC vs NDP+Green, MPs only',
-         _positions(df, dim_cols, mp, pl.col('FederalParty').is_in(['Conservative', 'PPC'])),
-         _positions(df, dim_cols, mp, pl.col('FederalParty').is_in(['NDP', 'Green']))),
-        ('office: federal Liberal vs rest',
-         _positions(df, dim_cols, partisan, ~opposition),
-         _positions(df, dim_cols, partisan, opposition)),
-        ('office: federal Liberal vs rest, MPs only',
-         _positions(df, dim_cols, mp, partisan, ~opposition),
-         _positions(df, dim_cols, mp, partisan, opposition)),
-        ('office: provincial government vs rest',
-         _positions(df, dim_cols, prov, in_gov),
-         _positions(df, dim_cols, prov, ~in_gov)),
-        ('office: provincial government vs rest, MLAs',
-         _positions(df, dim_cols, mla, prov, in_gov),
-         _positions(df, dim_cols, mla, prov, ~in_gov)),
+    spec = [
+        ('role', 'role: influencer vs politician',
+         [pl.col('MainType') == 'influencer'], [pl.col('MainType') == 'politician']),
+        ('flank', 'flank: Con+PPC vs NDP+Green, federal', [right], [left]),
+        ('flank_mps', 'flank: Con+PPC vs NDP+Green, MPs only', [mp, right], [mp, left]),
+        ('office_federal', 'office: federal Liberal vs rest',
+         [partisan, liberal], [partisan, ~liberal]),
+        ('office_federal_mps', 'office: federal Liberal vs rest, MPs only',
+         [mp, partisan, liberal], [mp, partisan, ~liberal]),
+        ('office_provincial', 'office: provincial government vs rest',
+         [prov, in_gov], [prov, ~in_gov]),
+        ('office_provincial_mlas', 'office: provincial government vs rest, MLAs',
+         [mla, prov, in_gov], [mla, prov, ~in_gov]),
     ]
+    return {key: (label, _positions(df, dim_cols, *a), _positions(df, dim_cols, *b))
+            for key, label, a, b in spec}
+
+
+def construct_contrasts(user_means_df, dim_cols, prefix):
+    """Every contrast, read one axis at a time and then against each other."""
+    rows = [v for v in contrast_rows(user_means_df, dim_cols).values()]
     report_contrasts(rows, dim_cols, prefix)
     print("\n  The same contrasts, as standardized logistic weights:")
     report_unique(rows, dim_cols, prefix)
     print("\n  Correlation between axes across users:")
+    mla = pl.col('SubType') == 'member of the provincial legislature'
+    mp = pl.col('SubType') == 'member of parliament'
+    prov = pl.col('ProvincialParty').is_not_null() & (pl.col('ProvincialParty') != '')
     axis_correlations(user_means_df, dim_cols, prefix, [
         ('all users', None),
         ('politicians', pl.col('MainType') == 'politician'),
         ('members of a provincial legislature', mla & prov),
-        ('members of parliament', mp & partisan),
+        ('members of parliament', mp & pl.col('FederalParty').is_not_null()),
     ])
 
 
@@ -479,6 +482,17 @@ CONTRASTS = [
 ]
 
 
+def load_user_means(cfg, dim_cols):
+    """One row per user: mean position per axis, with the seed metadata."""
+    target_df = load_latent_df(cfg, splits.SplitSpec.from_cfg(cfg))
+    rolling_df = rolling_frame(cfg, target_df, list(range(len(dim_cols))))
+    seed_df = load_seed_metadata_full(cfg, latent_space.traj_col(cfg))
+    rolling_df = rolling_df.with_columns(pl.col('filter_value').cast(pl.String)) \
+        .join(seed_df, left_on='filter_value',
+              right_on=latent_space.traj_col(cfg), how='left')
+    return compute_user_means(rolling_df, dim_cols)
+
+
 @hydra.main(version_base=None, config_path="../../config", config_name="config")
 def main(cfg):
     n_dims = cfg.n_dims
@@ -504,18 +518,14 @@ def main(cfg):
     common = variance_split(rolling_df, dim_cols, prefix)
     report_drift(common, dim_cols, prefix)
 
-    seed_df = load_seed_metadata_full(cfg, latent_space.traj_col(cfg))
-    rolling_df = rolling_df.with_columns(pl.col('filter_value').cast(pl.String)) \
-        .join(seed_df, left_on='filter_value',
-              right_on=latent_space.traj_col(cfg), how='left')
-    user_means_df = compute_user_means(rolling_df, dim_cols)
+    user_means_df = load_user_means(cfg, dim_cols)
 
     print("\n=== Which contrast among the parties each axis carries ===")
     parties, centroids, pooled = party_contrasts(user_means_df, dim_cols, prefix)
     named_contrasts(parties, centroids, pooled, dim_cols, prefix, CONTRASTS)
 
     for field in ('ProvincialParty', 'SubType'):
-        for _, b in AXIS_PAIRS:
+        for b in sorted({b for _, b in AXIS_PAIRS}):
             level_positions(user_means_df, field, dim_cols, prefix, sort_dim=b,
                             n_show=40)
 
