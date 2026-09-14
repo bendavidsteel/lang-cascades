@@ -222,7 +222,7 @@ def incumbency_test(user_means_df, dim_cols, prefix, min_size=MIN_GROUP_SIZE):
         .filter((pl.col('ProvincialParty') != '') & (pl.col('Province') != ''))
     agg = sub.group_by('ProvincialParty').agg(
         [pl.col(c).mean().alias(c) for c in dim_cols] +
-        [pl.col('Province').mode().first().alias('Province'), pl.len().alias('n')]
+        [pl.col('Province').mode().sort().first().alias('Province'), pl.len().alias('n')]
     ).filter(pl.col('n') >= min_size)
 
     deltas = []
