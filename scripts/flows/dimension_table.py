@@ -8,6 +8,7 @@ import hydra
 import latent_space
 
 NUM_CATS = 5
+TOP_TARGETS = 4
 
 # the groups describe_dimensions cuts the dimension into, and what to head them
 # with: the quantiles it split on, not a polarity, since the cut is by rank.
@@ -35,6 +36,19 @@ def format_prior(kind, tau):
     return f"{names.get(kind, kind)}, $\\tau$={tau:.0f}\\,d"
 
 
+def signed_targets(labels):
+    """The dimension's leading targets on each side of it.
+
+    Labels written before the two columns existed carry the same ranking in
+    the axis-label string, signed one target at a time.
+    """
+    if 'top_positive' in labels:
+        return labels['top_positive'], labels['top_negative']
+    ranked = labels['top_features'].partition('(')[2].split(', ')
+    return ([t[1:] for t in ranked if t.startswith('+')],
+            [t[1:] for t in ranked if t.startswith('-')])
+
+
 def table_start(groups, show_prior):
     """The header, widened to however many groups a dimension is cut into."""
     n = len(groups)
@@ -42,9 +56,10 @@ def table_start(groups, show_prior):
     lead = ['\\textbf{Dim.}']
     if show_prior:
         lead.append('\\textbf{Prior}')
-    lead += ['\\textbf{Var.}', '\\textbf{Targets}']
+    lead += ['\\textbf{Var.}',
+             '\\textbf{Targets ($+$)}', '\\textbf{Targets ($-$)}']
     first = len(lead) + 1
-    return f"""\\begin{{tabularx}}{{\\textwidth}}{{{'c|' * (len(lead) - 1)}X|{'X' * n}}}
+    return f"""\\begin{{tabularx}}{{\\textwidth}}{{{'c|' * (len(lead) - 2)}XX|{'X' * n}}}
 \\toprule
 {'& ' * len(lead)}\\multicolumn{{{n}}}{{c}}{{\\textbf{{Description}}}} \\\\
 \\cmidrule(lr){{{first}-{first - 1 + n}}}
@@ -85,10 +100,9 @@ def main(cfg):
         if show_prior:
             line += f"{format_prior(*priors[dim_idx])} & "
         line += f"{share} & "
-        # drop the axis name the label opens with, however long it is
-        top_targets = labels['top_features'].partition('(')[2].split(', ')[:4]
-        top_targets = [t.replace('&', '\\&') for t in top_targets]
-        line += ',\\newline '.join(top_targets) + " & "
+        for side in signed_targets(labels):
+            targets = [t.replace('&', '\\&') for t in side[:TOP_TARGETS]]
+            line += ',\\newline '.join(targets) + " & "
         line += ' & '.join(text_labels) + " \\\\"
         table_lines.append(line)
 

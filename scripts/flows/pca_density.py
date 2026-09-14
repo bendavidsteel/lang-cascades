@@ -80,6 +80,21 @@ def get_top_component_features(components, feature_names, n_features=3,
     
     return top_features
 
+def signed_top_features(top_features, n_features=4):
+    """The leading features on each side of a component, in ranked order.
+
+    A component whose strongest loadings share a sign is described by one end
+    of itself when the ranking is read by magnitude alone; taking each side in
+    turn gives what it raises as well as what it lowers.
+    """
+    raises, lowers = [], []
+    for feature_name, loading in top_features:
+        side = raises if loading > 0 else lowers
+        if len(side) < n_features:
+            side.append((feature_name, loading))
+    return raises, lowers
+
+
 def format_pca_axis_label(component_num, top_features, max_chars=100,
                           wrap=None, prefix='PC'):
     """Format axis label with top contributing features.

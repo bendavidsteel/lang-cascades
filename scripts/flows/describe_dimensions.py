@@ -13,9 +13,14 @@ from toponymy.llm_wrappers import AsyncVLLMNamer
 
 import latent_space
 from latent_space import COORD
-from pca_density import get_top_component_features, format_pca_axis_label
+from pca_density import (get_top_component_features, format_pca_axis_label,
+                         signed_top_features)
 
 logger = logging.getLogger(__name__)
+
+# Kept per side of a dimension, a few more than a table shows so that widening
+# one does not mean naming every dimension again.
+SIGNED_TARGETS = 8
 
 def load_text_df(cfg, columns=['id', 'createtime', 'seed', 'Document', 'Targets', 'Stances']):
     dir_path = cfg.base_stance_path
@@ -298,6 +303,9 @@ def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_feature
 
     dim_desc['mean'] = float(mean_val)
     dim_desc['top_features'] = target_names
+    raises, lowers = signed_top_features(dim_pca_features, SIGNED_TARGETS)
+    dim_desc['top_positive'] = [name for name, _ in raises]
+    dim_desc['top_negative'] = [name for name, _ in lowers]
 
     return dim_desc
 
