@@ -141,45 +141,36 @@ def compute_marginalized_grad_phi(model, t, z_2d, dim_1, dim_2, marginal_samples
 def t_to_datetime(t):
     return INITIAL_DATE + datetime.timedelta(days=t * UNIT_DAYS)
 
+# Which of describe_dimensions' cuts labels an axis. '2_cat' is the two
+# deciles: an axis label says what the ends of the axis mean, and a middle
+# band holds most of the population rather than a position on it.
+AXIS_LABEL_CUT = '2_cat'
+
+
+def axis_tick_labels(dimension_labels, dim):
+    """(positions, labels) for one dimension's axis, in ascending order."""
+    bands = dimension_labels.get(str(dim), {}).get(AXIS_LABEL_CUT, {})
+    ticks = []
+    for key, at in (('negative', 'negative_threshold'),
+                    ('neutral', 'mean'),
+                    ('positive', 'positive_threshold')):
+        if key in bands and at in bands:
+            ticks.append((bands[at], bands[key]))
+    return [t[0] for t in ticks], [t[1] for t in ticks]
+
+
 def show_x_dim_labels(ax, dimension_labels, dim):
-    # Get dimension 0 (x-axis) labels
-    dim0 = dimension_labels.get(str(dim), {}).get('3_cat', {})
-    x_tick_labels = []
-    x_tick_positions = []
+    positions, labels = axis_tick_labels(dimension_labels, dim)
+    if positions:
+        ax.set_xticks(positions)
+        ax.set_xticklabels(labels, fontsize=8, rotation=15, ha='right')
 
-    if 'negative' in dim0:
-        x_tick_labels.append(dim0['negative'])
-        x_tick_positions.append(dim0['negative_threshold'])
-    if 'neutral' in dim0:
-        x_tick_labels.append(dim0['neutral'])
-        x_tick_positions.append(dim0['mean'])
-    if 'positive' in dim0:
-        x_tick_labels.append(dim0['positive'])
-        x_tick_positions.append(dim0['positive_threshold'])
-
-    if x_tick_positions:
-        ax.set_xticks(x_tick_positions)
-        ax.set_xticklabels(x_tick_labels, fontsize=8, rotation=15, ha='right')
 
 def show_y_dim_labels(ax, dimension_labels, dim):
-    # Get dimension 1 (y-axis) labels
-    dim1 = dimension_labels.get(str(dim), {}).get('3_cat', {})
-    y_tick_labels = []
-    y_tick_positions = []
-
-    if 'negative' in dim1:
-        y_tick_labels.append(dim1['negative'])
-        y_tick_positions.append(dim1['negative_threshold'])
-    if 'neutral' in dim1:
-        y_tick_labels.append(dim1['neutral'])
-        y_tick_positions.append(dim1['mean'])
-    if 'positive' in dim1:
-        y_tick_labels.append(dim1['positive'])
-        y_tick_positions.append(dim1['positive_threshold'])
-
-    if y_tick_positions:
-        ax.set_yticks(y_tick_positions)
-        ax.set_yticklabels(y_tick_labels, fontsize=8, rotation=15, ha='right')
+    positions, labels = axis_tick_labels(dimension_labels, dim)
+    if positions:
+        ax.set_yticks(positions)
+        ax.set_yticklabels(labels, fontsize=8, rotation=15, ha='right')
 
 def load_dimension_labels(dimension_labels_path):
     """Labels from describe_dimensions.py, or none: a new representation has

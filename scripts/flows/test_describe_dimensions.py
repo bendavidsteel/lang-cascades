@@ -84,3 +84,22 @@ def test_a_dimension_with_too_little_on_its_targets_falls_back(rows, loadings):
     # nothing names a loaded target, so the band is filled from everything
     # these authors wrote rather than left empty
     assert out.height == 1
+
+
+def test_an_axis_is_labelled_at_the_two_deciles():
+    plot_nn_potential = pytest.importorskip('plot_nn_potential')
+    labels = {'0': {'2_cat': {'negative': 'low end', 'positive': 'high end',
+                              'negative_threshold': -2.0,
+                              'positive_threshold': 3.0}}}
+
+    positions, names = plot_nn_potential.axis_tick_labels(labels, 0)
+
+    # two ticks, ascending, and no middle: the 2_cat cut describes no middle
+    assert positions == [-2.0, 3.0]
+    assert names == ['low end', 'high end']
+
+
+def test_an_axis_with_no_labels_keeps_its_own_ticks():
+    plot_nn_potential = pytest.importorskip('plot_nn_potential')
+
+    assert plot_nn_potential.axis_tick_labels({}, 0) == ([], [])

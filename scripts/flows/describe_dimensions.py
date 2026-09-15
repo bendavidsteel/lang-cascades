@@ -18,6 +18,11 @@ from pca_density import (get_top_component_features, format_pca_axis_label,
 
 logger = logging.getLogger(__name__)
 
+# How many bands each dimension is described at. 2 is the deciles the figure
+# axes are labelled with, 5 the bands the dimension table lists, 3 what older
+# figures still read.
+CUTS = (2, 3, 5)
+
 # Kept per side of a dimension, a few more than a table shows so that widening
 # one does not mean naming every dimension again.
 SIGNED_TARGETS = 8
@@ -126,6 +131,36 @@ def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_feature
             {pos_text_df.shape[0]} positive docs, 
             {neg_text_df.shape[0]} negative docs, 
             {neutral_text_df.shape[0]} neutral docs""")
+    elif num_cats == 2:
+        # One decile at each end and no middle band: an axis label says what
+        # the ends of the axis mean, and the bulk between them is the
+        # population rather than a position on it.
+        positive_threshold = target_df.select(pl.col(dim_col).quantile(0.90)).item()
+        negative_threshold = target_df.select(pl.col(dim_col).quantile(0.10)).item()
+        mean_val = target_df.select(pl.col(dim_col).mean()).item()
+
+        # Split the documents by where their author stood when they posted
+        tagged = band_documents(target_df, text_df, pca_feature_df, dim_col,
+                                filter_val_col, n_exemplars)
+        v = pl.col('band_value')
+        pos_text_df = tagged.filter(v >= positive_threshold)\
+            .with_columns(pl.lit(0).alias('Topic'))
+        neg_text_df = tagged.filter(v <= negative_threshold)\
+            .with_columns(pl.lit(1).alias('Topic'))
+
+        assert min(len(pos_text_df), len(neg_text_df)) > n_exemplars, "Insufficient documents in one of the categories to select exemplars from. Consider reducing the number of categories or lowering the percentile thresholds."
+
+        cols = ['id', 'Document', 'Topic']
+        if 'embedding' in pos_text_df.columns:
+            cols.append('embedding')
+        combined_df = pl.concat([
+            pos_text_df.select(cols),
+            neg_text_df.select(cols),
+        ], how='diagonal_relaxed')
+
+        logging.info(f"""Dimension {dim}:
+            {pos_text_df.shape[0]} positive docs,
+            {neg_text_df.shape[0]} negative docs""")
     elif num_cats == 3:
         # Get thresholds for this dimension using polars
         positive_threshold = target_df.select(pl.col(dim_col).quantile(0.95)).item()
@@ -160,7 +195,7 @@ def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_feature
             {neg_text_df.shape[0]} negative docs, 
             {neutral_text_df.shape[0]} neutral docs""")
     else:
-        raise ValueError("num_cats must be 3 or 5")
+        raise ValueError("num_cats must be 2, 3 or 5")
 
     if combined_df.is_empty():
         logging.info(f"No documents found for dimension {dim}")
@@ -281,6 +316,19 @@ def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_feature
         logging.info(f"Dimension {dim} - Neutral: {neutral_label}")
         logging.info(f"Dimension {dim} - Negative: {neg_label}")
         logging.info(f"Dimension {dim} - Very Negative: {v_neg_label}")
+    elif num_cats == 2:
+        pos_label = topic_names_list[0] if len(topic_names_list) > 0 else "Unknown"
+        neg_label = topic_names_list[1] if len(topic_names_list) > 1 else "Unknown"
+
+        dim_desc = {
+            'positive': pos_label,
+            'negative': neg_label,
+            'positive_threshold': float(positive_threshold),
+            'negative_threshold': float(negative_threshold),
+        }
+
+        logging.info(f"Dimension {dim} - Positive: {pos_label}")
+        logging.info(f"Dimension {dim} - Negative: {neg_label}")
     elif num_cats == 3:
         # Extract labels for positive and negative extremes
         pos_label = topic_names_list[0] if len(topic_names_list) > 0 else "Unknown"
@@ -299,7 +347,7 @@ def get_dimension_description(target_df: pl.DataFrame, dim: int, dim_pca_feature
         logging.info(f"Dimension {dim} - Neutral: {neutral_label}")
         logging.info(f"Dimension {dim} - Negative: {neg_label}")
     else:
-        raise ValueError("num_cats must be 3 or 5")
+        raise ValueError("num_cats must be 2, 3 or 5")
 
     dim_desc['mean'] = float(mean_val)
     dim_desc['top_features'] = target_names
@@ -378,36 +426,23 @@ def get_dimension_descriptions(target_df: pl.DataFrame, pca_features, cfg):
         dim_pca_features = pca_features[f'PC{dim+1}']
         dimension_labels[dim] = {}
 
-        dim_desc = get_dimension_description(
-            target_df,
-            dim,
-            dim_pca_features,
-            text_df,
-            embedding_model,
-            llm,
-            num_cats=3,
-            n_exemplars=n_exemplars,
-            n_keyphrases=n_keyphrases,
-            exemplar_selection_method=exemplar_selection_method,
-            filter_val_col=cfg.filter_column,
-            axis_prefix=latent_space.axis_prefix(cfg)
-        )
-        dimension_labels[dim]['3_cat'] = dim_desc
-        dim_desc = get_dimension_description(
-            target_df,
-            dim,
-            dim_pca_features,
-            text_df,
-            embedding_model,
-            llm,
-            num_cats=5,
-            n_exemplars=n_exemplars,
-            n_keyphrases=n_keyphrases,
-            exemplar_selection_method=exemplar_selection_method,
-            filter_val_col=cfg.filter_column,
-            axis_prefix=latent_space.axis_prefix(cfg)
-        )
-        dimension_labels[dim]['5_cat'] = dim_desc
+        # every cut the figures and the table read: two deciles for an axis
+        # label, five bands for the table, three for what still asks for them
+        for num_cats in CUTS:
+            dimension_labels[dim][f'{num_cats}_cat'] = get_dimension_description(
+                target_df,
+                dim,
+                dim_pca_features,
+                text_df,
+                embedding_model,
+                llm,
+                num_cats=num_cats,
+                n_exemplars=n_exemplars,
+                n_keyphrases=n_keyphrases,
+                exemplar_selection_method=exemplar_selection_method,
+                filter_val_col=cfg.filter_column,
+                axis_prefix=latent_space.axis_prefix(cfg)
+            )
 
     return dimension_labels
 
