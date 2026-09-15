@@ -26,6 +26,7 @@ ROWS = [
     ('role', 'Influencer vs.\\ politician'),
     ('flank', 'Con.\\,$+$\\,PPC vs.\\ NDP\\,$+$\\,Green'),
     ('office_federal_mps', 'Liberal vs.\\ all other MPs'),
+    ('office_provincial_mlas', 'Gov.\\ vs.\\ opposition MLAs'),
     ('ppc', 'PPC vs.\\ all other parties'),
 ]
 
