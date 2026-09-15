@@ -282,6 +282,21 @@ def test_a_rival_scored_on_a_different_pool_is_not_mispaired():
     print('a rival from another pool is dropped, not paired by position')
 
 
+def test_a_horizon_with_no_training_pairs_is_not_a_leak():
+    """A rolled-back origin runs out of in-time room before out-of-time room."""
+    rolling_df = make_rolling()
+    paired = build_horizon_pairs(rolling_df, HORIZON, DIMS)
+    labelled = splits.label_pairs(paired, SPEC, time_col='future_createtime')
+    empty = splits.training_rows(labelled).head(0)
+    out_cell = splits.select(labelled, 'test', 'out')
+
+    # nothing to precede, so nothing to report -- and no comparison against a
+    # None that would crash the run
+    splits.check_leakage(empty, out_cell, 'test_out',
+                         time_col='future_createtime')
+    print('an empty training cell passes the leakage check')
+
+
 if __name__ == '__main__':
     for fn in (test_reported_scenarios_are_the_three_held_out_cells,
                test_cells_are_populated_and_disjoint,
@@ -296,6 +311,7 @@ if __name__ == '__main__':
                test_the_error_bar_is_the_spread_across_folds,
                test_a_horizon_missing_from_one_fold_is_left_out,
                test_the_landscape_is_tested_against_every_rival_it_is_drawn_beside,
-               test_a_rival_scored_on_a_different_pool_is_not_mispaired):
+               test_a_rival_scored_on_a_different_pool_is_not_mispaired,
+               test_a_horizon_with_no_training_pairs_is_not_a_leak):
         fn()
     print('\nall horizon-evaluation checks passed')

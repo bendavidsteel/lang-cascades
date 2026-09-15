@@ -208,6 +208,11 @@ def check_leakage(train_df, eval_df, scenario, time_col=TARGET_TIME):
     if time_split == 'out':
         latest_train = train_df[time_col].max()
         earliest_eval = eval_df[time_col].min()
+        # no training pair at this horizon leaves nothing for an evaluation
+        # pair to precede; a rolled-back origin runs out of in-time room at the
+        # long horizons before it runs out of out-of-time ones
+        if latest_train is None:
+            return
         if earliest_eval <= latest_train:
             raise AssertionError(
                 f'{scenario}: target at {earliest_eval} precedes the last '
