@@ -203,6 +203,55 @@ def test_stale_cache_rows_are_ignored():
     print('a cache written under one fingerprint is invisible under another')
 
 
+def _median_ratio(by_horizon, loss_key, baseline_key):
+    """A stand-in for the plot aggregator: one summary number per horizon."""
+    hs = sorted(by_horizon)
+    point = [float(np.median(by_horizon[h][loss_key])
+                   / np.median(by_horizon[h][baseline_key])) for h in hs]
+    return hs, np.array(point), None
+
+
+def _pair(loss, base=1.0):
+    return {'loss': np.array([loss]), 'base': np.array([base])}
+
+
+def test_a_fold_does_not_write_over_the_fixed_holdout_cache():
+    fixed = eh.cache_file('figs', '_theta', 'test_out',
+                          splits.SplitSpec(365, 0, 0.70, 0.10, 42))
+    fold = eh.cache_file('figs', '_theta', 'test_out',
+                         splits.SplitSpec(365, 91, 0.70, 0.10, 42))
+
+    # the fixed holdout keeps the name its cache was written under
+    assert fixed.endswith('nn_potential_horizon_skill_theta_test_out.parquet.zstd')
+    assert fold.endswith('nn_potential_horizon_skill_theta_test_out_o91.parquet.zstd')
+    print('a fold writes beside the fixed-holdout cache, not over it')
+
+
+def test_the_error_bar_is_the_spread_across_folds():
+    folds = [{30: _pair(2.0), 60: _pair(4.0)},
+             {30: _pair(3.0), 60: _pair(5.0)},
+             {30: _pair(4.0), 60: _pair(6.0)}]
+
+    hs, point, err = eh.across_folds(folds, _median_ratio, 'loss', 'base')
+
+    assert hs == [30, 60]
+    assert np.allclose(point, [3.0, 5.0])
+    assert np.allclose(err, [[1.0, 1.0], [1.0, 1.0]])
+    print('the bar spans the folds, not the pairs within one')
+
+
+def test_a_horizon_missing_from_one_fold_is_left_out():
+    folds = [{30: _pair(2.0), 720: _pair(9.0)},
+             {30: _pair(3.0)}]
+
+    hs, point, _ = eh.across_folds(folds, _median_ratio, 'loss', 'base')
+
+    # averaging a different set of folds at each horizon is not a curve
+    assert hs == [30]
+    assert np.allclose(point, [2.5])
+    print('a horizon only one fold reached is dropped')
+
+
 if __name__ == '__main__':
     for fn in (test_reported_scenarios_are_the_three_held_out_cells,
                test_cells_are_populated_and_disjoint,
@@ -212,6 +261,9 @@ if __name__ == '__main__':
                test_history_floor_scales_with_the_horizon,
                test_unreachable_horizons_are_dropped,
                test_reversion_baselines_beat_persistence_on_an_ou_process,
-               test_stale_cache_rows_are_ignored):
+               test_stale_cache_rows_are_ignored,
+               test_a_fold_does_not_write_over_the_fixed_holdout_cache,
+               test_the_error_bar_is_the_spread_across_folds,
+               test_a_horizon_missing_from_one_fold_is_left_out):
         fn()
     print('\nall horizon-evaluation checks passed')

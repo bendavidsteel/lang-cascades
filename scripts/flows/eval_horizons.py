@@ -179,6 +179,19 @@ def _file_digest(path):
         return hashlib.blake2b(fh.read(), digest_size=8).hexdigest()
 
 
+def cache_file(fig_path, stem, scenario, spec):
+    """Where one (method, scenario) cache lives for this split.
+
+    The origin is part of the name, and only when it is rolled back -- the same
+    rule SplitSpec.tag follows, so the fixed-holdout caches keep the names they
+    were written under while a fold gets its own file instead of overwriting
+    them.
+    """
+    origin = f'_o{spec.origin_offset_days}' if spec.origin_offset_days else ''
+    return os.path.join(
+        fig_path, f'nn_potential_horizon_skill{stem}_{scenario}{origin}.parquet.zstd')
+
+
 def cache_fingerprints(cfg, spec, state_path):
     """One fingerprint per cache name, covering everything that decides its rows.
 
@@ -690,6 +703,61 @@ def compute_landscape_shared_losses(rolling_df, horizon_days, dims, spec, scenar
         np.asarray(baseline_losses, dtype=np.float64)
 
 
+def fold_caches(cfg, offsets, fig_path, run_dir, select_state):
+    """Every fold's pair caches, keyed (offset, method, scenario).
+
+    Each fold was scored against its own model over its own split, so its
+    fingerprint is rebuilt from that fold's config rather than assumed.
+    """
+    import copy
+
+    out = {}
+    for offset in offsets:
+        cfg_o = copy.deepcopy(cfg)
+        cfg_o.split.origin_offset_days = int(offset)
+        spec_o = splits.SplitSpec.from_cfg(cfg_o)
+        state_o = select_state(run_dir(cfg_o))
+        if state_o is None:
+            raise SystemExit(
+                f'no checkpoint for origin -{offset}d under {run_dir(cfg_o)}. '
+                'rolling_holdout.py trains the folds; run it first.')
+        fp = cache_fingerprints(cfg_o, spec_o, state_o)
+        for name, stem, cols, _, _ in ACTIVE_CACHES:
+            for scenario, _, _ in SCENARIOS:
+                path = cache_file(fig_path, stem, scenario, spec_o)
+                by_horizon = _load_pair_cache(path, cols, fp[name])
+                if not by_horizon:
+                    raise SystemExit(
+                        f'no {name} cache for {scenario} at origin -{offset}d '
+                        f'({path}). Score that fold first:\n  python '
+                        f'eval_horizons.py <overrides> '
+                        f'split.origin_offset_days={offset}')
+                out[(offset, name, scenario)] = by_horizon
+    return out
+
+
+def across_folds(per_fold, aggregate, loss_key, baseline_key):
+    """One fold-averaged curve, with the spread across folds as the error bar.
+
+    Each fold contributes its own summary of its own pairs; the bar is the
+    range over folds, which is what a rolling holdout has to show -- not the
+    spread within any one of them.
+    """
+    curves = {}
+    for by_horizon in per_fold:
+        hs, point, _ = aggregate(by_horizon, loss_key, baseline_key)
+        for h, p in zip(hs, point):
+            curves.setdefault(h, []).append(p)
+    # only horizons every fold reached: a mean over a different set of folds at
+    # each horizon is not a curve
+    hs = sorted(h for h, v in curves.items() if len(v) == len(per_fold))
+    point = np.array([np.mean(curves[h]) for h in hs])
+    lo = np.array([np.min(curves[h]) for h in hs])
+    hi = np.array([np.max(curves[h]) for h in hs])
+    return hs, point, np.vstack([np.maximum(point - lo, 0.0),
+                                 np.maximum(hi - point, 0.0)])
+
+
 @hydra.main(version_base=None, config_path="../../config", config_name="config")
 def main(cfg):
     import jax
@@ -726,8 +794,7 @@ def main(cfg):
     cache_path, cached = {}, {}
     for name, stem, cols, _, _ in ACTIVE_CACHES:
         for scenario, _, _ in SCENARIOS:
-            path = os.path.join(
-                fig_path, f'nn_potential_horizon_skill{stem}_{scenario}.parquet.zstd')
+            path = cache_file(fig_path, stem, scenario, spec)
             cache_path[(name, scenario)] = path
             cached[(name, scenario)] = _load_pair_cache(path, cols, fingerprint[name])
 
@@ -1037,20 +1104,36 @@ def main(cfg):
 
     from scipy import stats
 
+    # Rolling holdout: one curve per method averaged over the folds, with the
+    # spread across origins as the error bar. Empty means the single fixed
+    # holdout this run was scored on.
+    rolling = [int(o) for o in (cfg.get('rolling_offsets') or [])]
+    folds = (fold_caches(cfg, rolling, fig_path, run_dir, select_state)
+             if rolling else {})
+
     def _spans(by_horizon, hs):
         """What each requested horizon's row shift really spans, for the x axis."""
         return [float(by_horizon[h]['actual_days'][0]) for h in hs]
 
     for ax, (scenario, title, subtitle) in zip(np.atleast_1d(axes), SCENARIOS):
-        model_cache = cached[(LANDSCAPE_CACHE, scenario)]
+        model_cache = (folds[(rolling[0], LANDSCAPE_CACHE, scenario)]
+                       if rolling else cached[(LANDSCAPE_CACHE, scenario)])
 
         h_model = med_model = None
         for name, _, _, loss_key, baseline_key in ACTIVE_CACHES:
-            by_horizon = cached[(name, scenario)]
+            if rolling:
+                per_fold = [folds[(o, name, scenario)] for o in rolling]
+                by_horizon = per_fold[0]
+            else:
+                by_horizon = cached[(name, scenario)]
             if not by_horizon:
                 continue
             label, fmt = CACHE_STYLE[name]
-            hs, point, err = _aggregate(by_horizon, loss_key, baseline_key)
+            if rolling:
+                hs, point, err = across_folds(per_fold, _aggregate,
+                                              loss_key, baseline_key)
+            else:
+                hs, point, err = _aggregate(by_horizon, loss_key, baseline_key)
             ax.errorbar(_spans(by_horizon, hs), point, yerr=err,
                         fmt=fmt, capsize=3, label=label)
             if name == LANDSCAPE_CACHE:
@@ -1092,22 +1175,31 @@ def main(cfg):
         # model_loss < baseline_loss per pair. Non-parametric because the
         # squared-error distribution is heavily right-tailed. Every horizon is
         # reported so the headline at REPORT_HORIZON_DAYS is not a selection.
-        for h in h_model:
-            losses = np.asarray(model_cache[h]['model_loss'], dtype=np.float64)
-            baseline = np.asarray(model_cache[h]['baseline_loss'], dtype=np.float64)
-            res = stats.wilcoxon(losses, baseline, alternative='less')
-            headline = ' <- reported' if h == REPORT_HORIZON_DAYS else ''
-            print(
-                f"  Wilcoxon signed-rank (model < baseline) at {h}d: "
-                f"n={len(losses)} statistic={res.statistic:.3g} "
-                f"p={res.pvalue:.3g} "
-                f"median(model-baseline)={float(np.median(losses - baseline)):.6g} "
-                f"frac_better={float(np.mean(losses < baseline)):.3f}{headline}",
-                flush=True,
-            )
+        # Per fold when rolling: the folds share trajectories and differ only
+        # in where the origin sits, so their pairs are not independent and
+        # pooling them into one test would overstate what was measured.
+        reports = ([(f'  origin -{o}d ', folds[(o, LANDSCAPE_CACHE, scenario)])
+                    for o in rolling] if rolling else [('  ', model_cache)])
+        for prefix, cache in reports:
+            for h in h_model:
+                if h not in cache:
+                    continue
+                losses = np.asarray(cache[h]['model_loss'], dtype=np.float64)
+                baseline = np.asarray(cache[h]['baseline_loss'], dtype=np.float64)
+                res = stats.wilcoxon(losses, baseline, alternative='less')
+                headline = ' <- reported' if h == REPORT_HORIZON_DAYS else ''
+                print(
+                    f"{prefix}Wilcoxon signed-rank (model < baseline) at {h}d: "
+                    f"n={len(losses)} statistic={res.statistic:.3g} "
+                    f"p={res.pvalue:.3g} "
+                    f"median(model-baseline)={float(np.median(losses - baseline)):.6g} "
+                    f"frac_better={float(np.mean(losses < baseline)):.3f}{headline}",
+                    flush=True,
+                )
 
     axes_list = list(np.atleast_1d(axes))
-    axes_list[0].set_ylabel(ylabel)
+    axes_list[0].set_ylabel(
+        f'{ylabel}\n(mean of {len(rolling)} origins, range)' if rolling else ylabel)
 
     # One legend under all three panels: in-axes it lands on the curves, which
     # converge on the no-movement line at the right of every panel. Matplotlib
@@ -1119,7 +1211,8 @@ def main(cfg):
                fontsize=8, ncol=len(labels), loc='lower center', frameon=False)
 
     fig.tight_layout(rect=(0, 0.08, 1, 1))
-    fig_file = os.path.join(fig_path, 'nn_potential_horizon_skill.png')
+    stem = '_rolling' if rolling else ''
+    fig_file = os.path.join(fig_path, f'nn_potential_horizon_skill{stem}.png')
     fig.savefig(fig_file, dpi=150, bbox_inches='tight')
     print(f"Saved figure to {fig_file}", flush=True)
 

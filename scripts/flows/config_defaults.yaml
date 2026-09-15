@@ -103,6 +103,11 @@ min_seed_posts: 1200         # pin_seeds.py floor; sd is high where posts are fe
 stationarity_boot: 199       # bootstrap replicates for the panel nulls
 stationarity_windows: 6      # time windows for the mean/variance drift test
 
+# eval_horizons.py. Origins to average the horizon curves over, as offsets from
+# the end of the data; each needs its own fold trained by rolling_holdout.py and
+# scored by a run at that offset. Empty reports the single fixed holdout.
+rolling_offsets: []
+
 # dimension_table.py. A Prior column earns its width only where the dimensions
 # carry different priors; a homogeneous fit repeats one value down the column.
 dimension_table_prior: false
