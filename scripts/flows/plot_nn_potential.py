@@ -219,12 +219,12 @@ def setup_y_axis_labels(ax, components, feature_names, dim_2=1, weights=None,
 MIN_LW = 0.3
 MAX_LW = 3.0
 LOG_DECADES = 3
-# How flow magnitude becomes streamline width. 'log' spreads LOG_DECADES
-# orders of magnitude over the width range, so a field whose flow spans
-# decades still shows its weak regions; 'linear' is proportional to the
-# magnitude, which reads the strong regions more faithfully and collapses
-# everything below a tenth of the maximum onto the floor.
-LINEWIDTH_SCALE = 'log'
+# How flow magnitude becomes streamline width. 'linear' is proportional to the
+# magnitude, so a basin reads as a pale interior inside heavy outer flow;
+# 'log' spreads LOG_DECADES orders of magnitude over the width range, which on
+# these fields puts almost everything at full width and flattens the contrast
+# it exists to show.
+LINEWIDTH_SCALE = 'linear'
 
 
 def flow_to_linewidth(flow_magnitude, max_val):
