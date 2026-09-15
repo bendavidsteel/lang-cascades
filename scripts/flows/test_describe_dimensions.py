@@ -105,7 +105,7 @@ def test_an_axis_with_no_labels_keeps_its_own_ticks():
     assert plot_nn_potential.axis_tick_labels({}, 0) == ([], [])
 
 
-def test_the_snapshots_span_the_fit_period_not_a_hardcoded_run_of_years():
+def test_the_snapshots_split_the_fit_period_evenly():
     import datetime
 
     plot_nn_potential = pytest.importorskip('plot_nn_potential')
@@ -115,26 +115,30 @@ def test_the_snapshots_span_the_fit_period_not_a_hardcoded_run_of_years():
     times = pl.Series([datetime.datetime(2022, 1, 8) + datetime.timedelta(days=16 * i)
                        for i in range(103)])
 
-    spans = plot_nn_potential.training_years(times, spec)
+    spans = plot_nn_potential.fit_period_spans(times, spec)
 
-    # every year the fit period touches, with the last one clipped where the
-    # holdout begins rather than running into data the model never saw
-    assert [y for y, _, _ in spans] == [2022, 2023, 2024, 2025]
-    assert spans[0][1] == datetime.datetime(2022, 1, 8)
-    assert spans[-1][2] == splits.time_cutoff(times, spec)
+    # the row covers the fit period end to end, in equal pieces, and stops
+    # where the holdout begins rather than running into unseen data
+    assert len(spans) == 3
+    assert spans[0][0] == times.min()
+    assert spans[-1][1] == splits.time_cutoff(times, spec)
+    assert spans[0][1] == spans[1][0] and spans[1][1] == spans[2][0]
+    widths = {(hi - lo).days for lo, hi in spans}
+    assert max(widths) - min(widths) <= 1
 
 
-def test_a_year_the_fit_period_barely_touches_gets_no_panel():
+def test_a_longer_dataset_widens_the_panels_rather_than_adding_them():
     import datetime
 
     plot_nn_potential = pytest.importorskip('plot_nn_potential')
     splits = pytest.importorskip('splits')
 
     spec = splits.SplitSpec(365, 0, 0.70, 0.10, 42)
-    # the fit period ends 2023-02-14, six weeks into 2023
-    times = pl.Series([datetime.datetime(2022, 1, 1),
-                       datetime.datetime(2024, 2, 14)])
+    short = pl.Series([datetime.datetime(2022, 1, 1), datetime.datetime(2025, 1, 1)])
+    long = pl.Series([datetime.datetime(2022, 1, 1), datetime.datetime(2027, 1, 1)])
 
-    spans = plot_nn_potential.training_years(times, spec)
+    a = plot_nn_potential.fit_period_spans(short, spec)
+    b = plot_nn_potential.fit_period_spans(long, spec)
 
-    assert [y for y, _, _ in spans] == [2022]
+    assert len(a) == len(b) == 3
+    assert (b[0][1] - b[0][0]) > (a[0][1] - a[0][0])

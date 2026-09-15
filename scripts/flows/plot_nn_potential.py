@@ -160,23 +160,24 @@ def axis_tick_labels(dimension_labels, dim):
     return [t[0] for t in ticks], [t[1] for t in ticks]
 
 
-def training_years(times, spec, min_overlap_days=90):
-    """Calendar years to snapshot, and the span of each inside the fit period.
+# Panels in the time-snapshot row. Three keeps the row readable; the fit
+# period is split evenly between them, so each panel widens as the data grows
+# rather than the row gaining panels.
+TIME_PANELS = 3
 
-    The panels cover the period the landscape was fitted on, which ends where
-    the holdout begins -- a year is included when enough of it falls before the
-    cutoff to be worth a panel, and its span is clipped there rather than
-    running into data the model never saw.
+
+def fit_period_spans(times, spec, n_panels=TIME_PANELS):
+    """Equal spans covering the period the landscape was fitted on.
+
+    From the first observation to where the holdout begins, so every panel
+    shows a drift field the model was actually fitted on and the row spans the
+    whole of the data rather than a hardcoded run of years.
     """
     start = min(times) if not isinstance(times, pl.Series) else times.min()
     cutoff = splits.time_cutoff(times, spec)
-    out = []
-    for year in range(start.year, cutoff.year + 1):
-        lo = max(start, datetime.datetime(year, 1, 1))
-        hi = min(cutoff, datetime.datetime(year, 12, 31))
-        if (hi - lo).days >= min_overlap_days:
-            out.append((year, lo, hi))
-    return out
+    step = (cutoff - start) / n_panels
+    edges = [start + step * i for i in range(n_panels + 1)]
+    return [(edges[i], edges[i + 1]) for i in range(n_panels)]
 
 
 def show_x_dim_labels(ax, dimension_labels, dim):
@@ -774,11 +775,11 @@ def main(cfg):
     
 
     if 'time_snapshots' in plots:
-        spans = training_years(target_df['createtime'], splits.SplitSpec.from_cfg(cfg))
-        years = [y for y, _, _ in spans]
-        print(f'time snapshots: {years} (the fit period, to '
-              f'{spans[-1][2]:%Y-%m-%d})', flush=True)
-        fig, axes = plt.subplots(1, len(years), figsize=(4 * len(years), 4.5))
+        spans = fit_period_spans(target_df['createtime'],
+                                 splits.SplitSpec.from_cfg(cfg))
+        print('time snapshots: ' + ', '.join(f'{lo:%Y-%m-%d}..{hi:%Y-%m-%d}'
+                                             for lo, hi in spans), flush=True)
+        fig, axes = plt.subplots(1, len(spans), figsize=(4 * len(spans), 4.5))
 
         # Pre-compute flow magnitudes across all years for global linewidth normalization
         all_flow_magnitudes = []
@@ -786,7 +787,7 @@ def main(cfg):
         x = np.linspace(*plot_kwargs['xrange'], spatial_res, dtype=np.float64)
         y = np.linspace(*plot_kwargs['yrange'], spatial_res, dtype=np.float64)
         xs, ys = np.meshgrid(x, y)
-        for _, lo, hi in tqdm(spans, desc="Pre-computing flow (time)"):
+        for lo, hi in tqdm(spans, desc="Pre-computing flow (time)"):
             t_range = ((lo - INITIAL_DATE).days / UNIT_DAYS,
                        (hi - INITIAL_DATE).days / UNIT_DAYS)
             t_mid = (t_range[0] + t_range[1]) / 2.0
@@ -806,7 +807,7 @@ def main(cfg):
         global_p75 = np.percentile(all_mags, 75)
         global_max = all_mags.max()
 
-        for i, (yr, lo, hi) in enumerate(tqdm(spans, desc="Plotting time snapshots")):
+        for i, (lo, hi) in enumerate(tqdm(spans, desc="Plotting time snapshots")):
             t_range = ((lo - INITIAL_DATE).days / UNIT_DAYS,
                        (hi - INITIAL_DATE).days / UNIT_DAYS)
             plot_kwargs['t_range'] = t_range
@@ -816,7 +817,7 @@ def main(cfg):
             plot_kwargs['show_legend'] = False
             # one caption under the middle panel: the loading list is wide
             # enough that three of them collide across the row
-            plot_kwargs['show_x_axis_labels'] = (i == len(years) // 2)
+            plot_kwargs['show_x_axis_labels'] = (i == len(spans) // 2)
             plot_kwargs['show_y_axis_labels'] = (i == 0)
             plot_kwargs['show_x_tick_labels'] = True
             plot_kwargs['show_y_tick_labels'] = (i == 0)
@@ -825,8 +826,7 @@ def main(cfg):
             plot_kwargs['show_kde'] = False
             plot_kwargs['show_hatching'] = False
             plot_density_streamplot(fig, axes[i], model, target_df, components, stance_cols, **plot_kwargs)
-            partial = (lo.month, lo.day) != (1, 1) or (hi.month, hi.day) != (12, 31)
-            axes[i].set_title(f'{yr} ({lo:%b}--{hi:%b})' if partial else f'{yr}')
+            axes[i].set_title(f'{lo:%b %Y}--{hi:%b %Y}')
 
         fig.subplots_adjust(
             left=0.05,
