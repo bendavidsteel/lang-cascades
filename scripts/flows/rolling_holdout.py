@@ -32,9 +32,9 @@ REPO = os.path.dirname(os.path.dirname(HERE))
 # train_in is the fit, not a test; the other five are what the design buys.
 SCENARIOS = ['val_in', 'test_in', 'train_out', 'val_out', 'test_out']
 LABELS = {
-    'val_in': 'unseen trajectory, seen time',
-    'test_in': 'unseen trajectory, seen time (test)',
-    'train_out': 'seen trajectory, unseen time',
+    'val_in': 'unseen person, seen time',
+    'test_in': 'unseen person, seen time (test)',
+    'train_out': 'seen person, unseen time',
     'val_out': 'both unseen (val)',
     'test_out': 'both unseen (test)',
 }
