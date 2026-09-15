@@ -26,6 +26,7 @@ ROWS = [
     ('role', 'Influencer vs.\\ politician'),
     ('flank', 'Con.\\,$+$\\,PPC vs.\\ NDP\\,$+$\\,Green'),
     ('office_federal_mps', 'Liberal vs.\\ all other MPs'),
+    ('ppc', 'PPC vs.\\ all other parties'),
 ]
 
 TABLE_END = """    \\bottomrule

@@ -376,6 +376,10 @@ def contrast_rows(user_means_df, dim_cols):
     liberal = pl.col('FederalParty') == 'Liberal'
     right = pl.col('FederalParty').is_in(['Conservative', 'PPC'])
     left = pl.col('FederalParty').is_in(['NDP', 'Green'])
+    ppc = pl.col('FederalParty') == 'PPC'
+    # the two parties that have never held a seat, read together and apart:
+    # what they share is standing outside the House rather than a programme
+    outside = pl.col('FederalParty').is_in(['PPC', 'Green'])
     mp = pl.col('SubType') == 'member of parliament'
     mla = pl.col('SubType') == 'member of the provincial legislature'
     in_gov = pl.col('ProvincialParty').is_in(list(PROVINCIAL_GOVERNMENTS))
@@ -396,6 +400,10 @@ def contrast_rows(user_means_df, dim_cols):
          [prov, in_gov], [prov, ~in_gov]),
         ('office_provincial_mlas', 'office: provincial government vs rest, MLAs',
          [mla, prov, in_gov], [mla, prov, ~in_gov]),
+        ('ppc', 'outside: PPC vs other federal parties',
+         [partisan, ppc], [partisan, ~ppc]),
+        ('ppc_green', 'outside: Green+PPC vs other federal parties',
+         [partisan, outside], [partisan, ~outside]),
     ]
     return {key: (label, _positions(df, dim_cols, *a), _positions(df, dim_cols, *b))
             for key, label, a, b in spec}
