@@ -1308,7 +1308,10 @@ def main(cfg):
     write_significance(significance, rival_names,
                        cfg.get('out_dir', './out'), rolling)
 
-    stem = '_rolling' if rolling else ''
+    # the origin in the name, like the caches: a fold's own figure must not
+    # land on top of the fixed holdout's
+    origin = f'_o{spec.origin_offset_days}' if spec.origin_offset_days else ''
+    stem = '_rolling' if rolling else origin
     fig_file = os.path.join(fig_path, f'nn_potential_horizon_skill{stem}.png')
     fig.savefig(fig_file, dpi=150, bbox_inches='tight')
     print(f"Saved figure to {fig_file}", flush=True)
