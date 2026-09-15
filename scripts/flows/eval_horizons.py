@@ -11,6 +11,7 @@ from tqdm import tqdm
 
 import latent_space
 import splits
+from multiple_testing import benjamini_hochberg, significance_stars
 
 # Heavy imports (jax, plnn, matplotlib) are deferred into main() so that
 # import-time costs are only paid for the ETS/landscape branches that need
@@ -703,6 +704,88 @@ def compute_landscape_shared_losses(rolling_df, horizon_days, dims, spec, scenar
         np.asarray(baseline_losses, dtype=np.float64)
 
 
+def write_significance(significance, rivals, out_dir, rolling):
+    """The head-to-head tests beside the figure, as a table the paper can use.
+
+    A cell is how often the landscape beat that rival: `frac_better`, and for a
+    rolling design how many folds cleared the correction, since five folds over
+    shared trajectories are not five independent tests.
+    """
+    scenarios = [s for s, _, _ in SCENARIOS]
+    horizons = sorted({r['horizon'] for rows in significance.values() for r in rows})
+    lines = [f"\\begin{{tabular}}{{ll{'r' * len(rivals)}}}", '\\toprule',
+             'Cell & Horizon & ' + ' & '.join(rivals) + ' \\\\', '\\midrule']
+    for scenario, title, _ in SCENARIOS:
+        for horizon in horizons:
+            cells = []
+            for rival in rivals:
+                rows = [r for key, v in significance.items() if key[0] == scenario
+                        for r in v if r['horizon'] == horizon and r['rival'] == rival]
+                if not rows:
+                    cells.append('--')
+                    continue
+                frac = np.mean([r['frac_better'] for r in rows])
+                if rolling:
+                    beat = sum(1 for r in rows if r['q'] < 0.05)
+                    cells.append(f'{frac:.2f} ({beat}/{len(rows)})')
+                else:
+                    cells.append(f"{frac:.2f}{significance_stars(rows[0]['q'])}")
+            lines.append(f'{title} & {horizon}d & ' + ' & '.join(cells) + ' \\\\')
+        lines.append('\\midrule')
+    lines[-1] = '\\bottomrule'
+    lines.append('\\end{tabular}')
+
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, 'horizon_significance.tex')
+    with open(path, 'w') as f:
+        f.write('\n'.join(lines))
+    print(f'Wrote {path}', flush=True)
+
+
+def head_to_head(model_cache, rivals, horizons):
+    """One-sided Wilcoxon of the landscape against each rival, per horizon.
+
+    `rivals` maps a label to per-pair losses keyed by horizon. Every method is
+    scored on one shared pair set in one order, so the pairing is by position;
+    a length that disagrees means the caches came from different pools and the
+    row is dropped rather than silently mispaired.
+
+    Corrected together: the horizons and rivals of one panel are one family.
+    """
+    from scipy import stats
+
+    rows = []
+    for h in horizons:
+        if h not in model_cache:
+            continue
+        losses = np.asarray(model_cache[h]['model_loss'], dtype=np.float64)
+        for label, by_horizon in rivals.items():
+            if by_horizon is None:
+                rival = np.asarray(model_cache[h]['baseline_loss'], dtype=np.float64)
+            elif h not in by_horizon:
+                continue
+            else:
+                key = next(k for k in by_horizon[h] if k.endswith('_loss')
+                           and not k.endswith('_baseline_loss'))
+                rival = np.asarray(by_horizon[h][key], dtype=np.float64)
+            if len(rival) != len(losses):
+                print(f"  {label} at {h}d: {len(rival)} pairs against the "
+                      f"landscape's {len(losses)}; not one pool, skipping",
+                      flush=True)
+                continue
+            res = stats.wilcoxon(losses, rival, alternative='less')
+            rows.append({
+                'horizon': h, 'rival': label, 'n': len(losses),
+                'p': float(res.pvalue),
+                'frac_better': float(np.mean(losses < rival)),
+                'median_diff': float(np.median(losses - rival)),
+            })
+    q, _ = benjamini_hochberg(np.array([r['p'] for r in rows]))
+    for row, adjusted in zip(rows, q):
+        row['q'] = float(adjusted)
+    return rows
+
+
 def fold_caches(cfg, offsets, fig_path, run_dir, select_state):
     """Every fold's pair caches, keyed (offset, method, scenario).
 
@@ -1108,6 +1191,7 @@ def main(cfg):
     # spread across origins as the error bar. Empty means the single fixed
     # holdout this run was scored on.
     rolling = [int(o) for o in (cfg.get('rolling_offsets') or [])]
+    significance = {}
     folds = (fold_caches(cfg, rolling, fig_path, run_dir, select_state)
              if rolling else {})
 
@@ -1175,25 +1259,33 @@ def main(cfg):
         # model_loss < baseline_loss per pair. Non-parametric because the
         # squared-error distribution is heavily right-tailed. Every horizon is
         # reported so the headline at REPORT_HORIZON_DAYS is not a selection.
-        # Per fold when rolling: the folds share trajectories and differ only
-        # in where the origin sits, so their pairs are not independent and
-        # pooling them into one test would overstate what was measured.
-        reports = ([(f'  origin -{o}d ', folds[(o, LANDSCAPE_CACHE, scenario)])
-                    for o in rolling] if rolling else [('  ', model_cache)])
-        for prefix, cache in reports:
-            for h in h_model:
-                if h not in cache:
+        # Against the no-movement baseline and against every method drawn
+        # beside it, one-sided and paired over the shared pool. Per fold when
+        # rolling: the folds share trajectories and differ only in where the
+        # origin sits, so pooling their pairs would overstate n.
+        report_folds = (list(rolling) if rolling else [None])
+        for offset in report_folds:
+            cache = (folds[(offset, LANDSCAPE_CACHE, scenario)]
+                     if rolling else model_cache)
+            against = {'No-movement': None}
+            for name, _, _, _, _ in ACTIVE_CACHES:
+                if name == LANDSCAPE_CACHE:
                     continue
-                losses = np.asarray(cache[h]['model_loss'], dtype=np.float64)
-                baseline = np.asarray(cache[h]['baseline_loss'], dtype=np.float64)
-                res = stats.wilcoxon(losses, baseline, alternative='less')
-                headline = ' <- reported' if h == REPORT_HORIZON_DAYS else ''
+                against[CACHE_STYLE[name][0]] = (folds[(offset, name, scenario)]
+                                                 if rolling
+                                                 else cached[(name, scenario)])
+            rows = head_to_head(cache, against, h_model)
+            significance[(scenario, offset)] = rows
+            prefix = f'  origin -{offset}d ' if rolling else '  '
+            for row in rows:
+                headline = (' <- reported' if row['horizon'] == REPORT_HORIZON_DAYS
+                            and row['rival'] == 'No-movement' else '')
                 print(
-                    f"{prefix}Wilcoxon signed-rank (model < baseline) at {h}d: "
-                    f"n={len(losses)} statistic={res.statistic:.3g} "
-                    f"p={res.pvalue:.3g} "
-                    f"median(model-baseline)={float(np.median(losses - baseline)):.6g} "
-                    f"frac_better={float(np.mean(losses < baseline)):.3f}{headline}",
+                    f"{prefix}landscape vs {row['rival']} at {row['horizon']}d: "
+                    f"n={row['n']} p={row['p']:.3g} q={row['q']:.3g} "
+                    f"{significance_stars(row['q'])} "
+                    f"median(model-rival)={row['median_diff']:.6g} "
+                    f"frac_better={row['frac_better']:.3f}{headline}",
                     flush=True,
                 )
 
@@ -1211,6 +1303,11 @@ def main(cfg):
                fontsize=8, ncol=len(labels), loc='lower center', frameon=False)
 
     fig.tight_layout(rect=(0, 0.08, 1, 1))
+    rival_names = ['No-movement'] + [CACHE_STYLE[n][0] for n, _, _, _, _ in ACTIVE_CACHES
+                                     if n != LANDSCAPE_CACHE]
+    write_significance(significance, rival_names,
+                       cfg.get('out_dir', './out'), rolling)
+
     stem = '_rolling' if rolling else ''
     fig_file = os.path.join(fig_path, f'nn_potential_horizon_skill{stem}.png')
     fig.savefig(fig_file, dpi=150, bbox_inches='tight')

@@ -252,6 +252,36 @@ def test_a_horizon_missing_from_one_fold_is_left_out():
     print('a horizon only one fold reached is dropped')
 
 
+def test_the_landscape_is_tested_against_every_rival_it_is_drawn_beside():
+    rng = np.random.default_rng(0)
+    model = rng.normal(1.0, 0.1, 400)
+    model_cache = {30: {'model_loss': model, 'baseline_loss': model + 0.5}}
+    rivals = {'No-movement': None,
+              'Damped Theta': {30: {'theta_loss': model + 0.3}},
+              'AR(1) to mean': {30: {'ar1_loss': model - 0.5}}}
+
+    rows = eh.head_to_head(model_cache, rivals, [30])
+
+    got = {r['rival']: r for r in rows}
+    assert set(got) == {'No-movement', 'Damped Theta', 'AR(1) to mean'}
+    # beats the two it is cheaper than, loses to the one it is not
+    assert got['No-movement']['q'] < 0.05 and got['Damped Theta']['q'] < 0.05
+    assert got['AR(1) to mean']['q'] > 0.05
+    assert got['AR(1) to mean']['frac_better'] == 0.0
+    print('the landscape is tested against every rival, not just no-movement')
+
+
+def test_a_rival_scored_on_a_different_pool_is_not_mispaired():
+    model_cache = {30: {'model_loss': np.ones(10), 'baseline_loss': np.ones(10) * 2}}
+    rivals = {'Damped Theta': {30: {'theta_loss': np.ones(7)}}}
+
+    rows = eh.head_to_head(model_cache, rivals, [30])
+
+    # pairing is by position, so a different length is a different pool
+    assert rows == []
+    print('a rival from another pool is dropped, not paired by position')
+
+
 if __name__ == '__main__':
     for fn in (test_reported_scenarios_are_the_three_held_out_cells,
                test_cells_are_populated_and_disjoint,
@@ -264,6 +294,8 @@ if __name__ == '__main__':
                test_stale_cache_rows_are_ignored,
                test_a_fold_does_not_write_over_the_fixed_holdout_cache,
                test_the_error_bar_is_the_spread_across_folds,
-               test_a_horizon_missing_from_one_fold_is_left_out):
+               test_a_horizon_missing_from_one_fold_is_left_out,
+               test_the_landscape_is_tested_against_every_rival_it_is_drawn_beside,
+               test_a_rival_scored_on_a_different_pool_is_not_mispaired):
         fn()
     print('\nall horizon-evaluation checks passed')
