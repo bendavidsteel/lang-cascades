@@ -39,8 +39,11 @@ sample they were drawn from with --sample.
 The report is written to stdout. --output also saves it; give that a .tex path and
 the results come out as booktabs tabulars instead, one tabular per file, named after
 that path, with no table environment or caption, so each can be \\input where its
-caption is written. One of them is a reduced table -- macro-F1 and kappa, overall
-and per subgroup, no intervals -- for where the full ones do not fit.
+caption is written. Pass several coders and the model-vs-coder tables are written for
+the first one only, with the rest reported by an added tabular scoring every rater
+pair; extraction validity gets a column per coder instead. One of them is a reduced
+table -- macro-F1 and kappa, overall and per subgroup, no intervals -- for where the
+full ones do not fit.
 
 Examples:
     python scripts/target_mining/score_coded_posts.py -i out/stance_coding_coder_2026-07-29.csv
@@ -1138,42 +1141,75 @@ def tex_tabular(spec, header, body):
             + [r'\midrule'] + body + [r'\bottomrule', r'\end{tabular}'])
 
 
-def tex_slug(text):
-    return ''.join(c if c.isalnum() else '_' for c in text).strip('_').lower()
-
-
-def tex_extraction(table, seed):
+def extraction_stats(table, seed):
+    """Extraction validity as (n, rate, CI) rows, in the order the table lists them."""
     coded = [(k, r) for k, r in table.items() if relevance_of(r) is not None]
     if not coded:
-        return []
+        return None
     flags = [relevance_of(r) for _, r in coded]
-    share = sum(flags) / len(flags)
-    body = [tex_row(['Extracted targets judged relevant', len(flags),
-                     tex_pct(share),
-                     tex_pct_ci(bootstrap_ci(flags, lambda s: sum(s) / len(s),
-                                             seed=seed))])]
+    rows = [(len(flags), sum(flags) / len(flags),
+             bootstrap_ci(flags, lambda s: sum(s) / len(s), seed=seed))]
+
     weights = weights_of([r for _, r in coded])
     if any(abs(w - 1.0) > 1e-9 for w in weights):
         items = list(zip(flags, weights))
-        body.append(tex_row([
-            r'\quad weighted to all extracted pairs', len(flags),
-            tex_pct(sum(w for f, w in items if f) / sum(weights)),
-            tex_pct_ci(bootstrap_ci(
-                items, lambda s: sum(w for f, w in s if f) / sum(w for _, w in s),
-                seed=seed))]))
+        rows.append((len(flags), sum(w for f, w in items if f) / sum(weights),
+                     bootstrap_ci(
+                         items,
+                         lambda s: sum(w for f, w in s if f) / sum(w for _, w in s),
+                         seed=seed)))
+    else:
+        rows.append(None)
+
     per_post = defaultdict(list)
     for (platform, post_id, _), r in coded:
         per_post[(platform, post_id)].append(relevance_of(r))
     any_relevant = sum(1 for f in per_post.values() if any(f))
-    body.append(tex_row(['Posts with at least one relevant target', len(per_post),
-                         tex_pct(any_relevant / len(per_post)),
-                         tex_pct_ci(wilson_ci(any_relevant, len(per_post)))]))
-    body.append(tex_row(['Mean per-post share of relevant targets', len(per_post),
-                         tex_pct(sum(sum(f) / len(f) for f in per_post.values())
-                                 / len(per_post)), '']))
-    return [('extraction',
-             'target-extraction validity; recall is not identified by this design',
-             tex_tabular('lrrr', [tex_row(['', '$n$', r'\%', r'95\% CI'])], body))]
+    rows.append((len(per_post), any_relevant / len(per_post),
+                 wilson_ci(any_relevant, len(per_post))))
+    rows.append((len(per_post),
+                 sum(sum(f) / len(f) for f in per_post.values()) / len(per_post),
+                 None))
+    return rows
+
+
+EXTRACTION_ROWS = ['Extracted targets judged relevant',
+                   r'\quad weighted to all extracted pairs',
+                   'Posts with at least one relevant target',
+                   'Mean per-post share of relevant targets']
+
+
+def tex_extraction(coders, seed):
+    """Extraction validity, one pair of columns per coder who judged it."""
+    judged = OrderedDict((name, extraction_stats(table, seed))
+                         for name, table in coders.items())
+    judged = OrderedDict((k, v) for k, v in judged.items() if v)
+    if not judged:
+        return []
+
+    body = []
+    for i, label in enumerate(EXTRACTION_ROWS):
+        cells, n = [], ''
+        for stats in judged.values():
+            if stats[i] is None:
+                cells += ['', '']
+                continue
+            n, rate, bounds = stats[i]
+            cells += [tex_pct(rate), tex_pct_ci(bounds) if bounds else '']
+        if any(c for c in cells):
+            body.append(tex_row([label, n] + cells))
+
+    header = [tex_row(['', '$n$'] + [r'\%', r'95\% CI'] * len(judged))]
+    if len(judged) > 1:
+        header = [tex_row(['', ''] + [rf'\multicolumn{{2}}{{c}}{{{tex(name)}}}'
+                                      for name in judged]),
+                  ' '.join(rf'\cmidrule(lr){{{3 + 2 * i}-{4 + 2 * i}}}'
+                           for i in range(len(judged)))] + header
+    comment = 'target-extraction validity; recall is not identified by this design'
+    if len(judged) > 1:
+        comment += '; each coder judged the same extracted targets'
+    return [('extraction', comment,
+             tex_tabular('lr' + 'rr' * len(judged), header, body))]
 
 
 def tex_scopes(table):
@@ -1410,20 +1446,65 @@ def tex_reduced(table, min_cell):
              tex_tabular('@{}llrrr@{}', header, body))]
 
 
+def tex_raters(coders, seed):
+    """Every rater pair scored alike: the classifier against each coder, then the
+    coders against each other, so the classifier's distance from a coder can be read
+    against the distance between two coders."""
+    names = list(coders)
+    if len(names) < 2:
+        return []
+
+    def cells(gold, pred):
+        score = prf(gold, pred, STANCES)
+        bounds = bootstrap_ci(
+            list(zip(gold, pred)),
+            lambda s: cohen_kappa([g for g, _ in s], [p for _, p in s], STANCES),
+            seed=seed)
+        return [len(gold), num(score['accuracy']), num(score['macro']['f1']),
+                f"{num(cohen_kappa(gold, pred, STANCES))} {ci(bounds)}".strip()]
+
+    body = []
+    for name in names:
+        pairs = stance_pairs(coders[name], False)
+        if len(pairs) >= 2:
+            body.append(tex_row([rf'Classifier vs.\ {tex(name)}']
+                                + cells([g for _, _, g, _ in pairs],
+                                        [p for _, _, _, p in pairs])))
+    between = []
+    for i in range(len(names)):
+        for j in range(i + 1, len(names)):
+            a, b = coders[names[i]], coders[names[j]]
+            shared = [k for k in a if stance_of(a[k]) is not None
+                      and stance_of(b.get(k, {})) is not None]
+            if len(shared) >= 2:
+                between.append(tex_row(
+                    [rf'{tex(names[i])} vs.\ {tex(names[j])}']
+                    + cells([stance_of(a[k]) for k in shared],
+                            [stance_of(b[k]) for k in shared])))
+    if not body or not between:
+        return []
+    body += [r'\midrule'] + between
+
+    header = [tex_row(['', '$n$', 'Acc.', r'$\overline{F}_1$', r"Cohen's $\kappa$"])]
+    return [('raters',
+             'stance agreement for every rater pair over all coded pairs; macro-F1 '
+             r'takes the first-named rater as gold, 95\% bootstrap CI on $\kappa$',
+             tex_tabular('@{}lrrrr@{}', header, body))]
+
+
 def latex_tables(coders, meta, seed, min_cell, n_bins):
     """(file slug, lines) per result tabular, captions left to the author.
 
     One tabular per file so each can be \\input where its caption is written; the
     comment at the top of a file says what it holds and what the dagger means.
     """
-    tables = []
-    for name, table in coders.items():
-        per_coder = (tex_extraction(table, seed) + tex_agreement(table, seed)
-                     + tex_per_class(table) + tex_reliability(table, seed, n_bins)
-                     + tex_subgroups(table, min_cell) + tex_reduced(table, min_cell))
-        suffix = '' if len(coders) == 1 else f'_{tex_slug(name)}'
-        tables += [(slug + suffix, comment, lines)
-                   for slug, comment, lines in per_coder]
+    # the first coder is the gold standard every model-vs-coder table is scored on;
+    # a second coder is a rater to compare with, not a second set of every table
+    primary = coders[list(coders)[0]]
+    tables = (tex_extraction(coders, seed) + tex_agreement(primary, seed)
+              + tex_per_class(primary) + tex_reliability(primary, seed, n_bins)
+              + tex_subgroups(primary, min_cell) + tex_reduced(primary, min_cell)
+              + tex_raters(coders, seed))
 
     files = []
     for slug, comment, lines in tables:
