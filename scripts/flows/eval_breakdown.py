@@ -41,6 +41,8 @@ HORIZONS = [30]
 CATEGORY_COLS = ['MainType', 'Party']
 # Exclude degenerate subsets with near-zero baseline
 MIN_BASELINE_MSE = 1e-5
+# Exclude subgroups backed by too few trajectories to say anything about
+MIN_TRAJECTORIES = 5
 
 # Plot aggregator (mirrors eval_horizons.py terminology):
 #   'median_per_pair' = median(model_i / baseline_i) with IQR shown as a
@@ -422,6 +424,16 @@ def main(cfg):
     metrics_df, losses_by_key = compute_breakdown_metrics(cfg)
     if len(metrics_df) == 0:
         print("No metrics produced; nothing to plot.")
+        return
+
+    small = metrics_df.filter(pl.col('n_trajectories') < MIN_TRAJECTORIES)
+    for row in small.iter_rows(named=True):
+        print(f"  Dropping {row['subset']} at {row['horizon']}d: "
+              f"n_traj={row['n_trajectories']} < {MIN_TRAJECTORIES}")
+    # before the correction, so the sparse subgroups do not spend BH's budget
+    metrics_df = metrics_df.filter(pl.col('n_trajectories') >= MIN_TRAJECTORIES)
+    if len(metrics_df) == 0:
+        print("No subgroups left after the size filter; nothing to plot.")
         return
 
     print("\nRunning significance tests (Wilcoxon signed-rank, BH-corrected)...")
