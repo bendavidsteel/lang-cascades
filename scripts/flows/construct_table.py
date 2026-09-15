@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # Rows to show, as (key into contrast_rows, how to name it in the table).
 ROWS = [
     ('role', 'Influencer vs.\\ politician'),
-    ('flank', 'Con.\\,$+$\\,PPC vs.\\ NDP\\,$+$\\,Green'),
+    ('flank', 'CPC\\,$+$\\,PPC vs.\\ NDP\\,$+$\\,Green'),
     ('office_federal_mps', 'Liberal vs.\\ all other MPs'),
     ('office_provincial_mlas', 'Gov.\\ vs.\\ opposition MLAs'),
     ('ppc', 'PPC vs.\\ all other parties'),
