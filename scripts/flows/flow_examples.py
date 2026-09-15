@@ -9,6 +9,7 @@ from scipy import stats
 
 import latent_space
 from latent_space import COORD
+from multiple_testing import benjamini_hochberg
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +119,9 @@ def directional_stance_shift(table, stances, expected_sign):
     including favour and against both draining into neutral, so the statistic
     here is the shift in mean stance score, tested against the null that the
     two periods are a random split of the pooled counts (linear-by-linear
-    association). Returns (p_value, shift in score points).
+    association). Returns (p_value, shift in score points), the p-value nan
+    where there is no contrast to test, so that a correction counts it as no
+    test rather than as one that failed.
     """
     scores = np.array([STANCE_SCORES.get(s, 0.0) for s in stances], dtype=float)
     early = table[0].astype(float)
@@ -126,7 +129,7 @@ def directional_stance_shift(table, stances, expected_sign):
     n_early, n_late = early.sum(), late.sum()
     n = n_early + n_late
     if n_early == 0 or n_late == 0 or n < 3:
-        return 1.0, 0.0
+        return np.nan, 0.0
 
     shift = float(late @ scores / n_late - early @ scores / n_early)
 
@@ -134,7 +137,7 @@ def directional_stance_shift(table, stances, expected_sign):
     mean_score = pooled @ scores
     var_score = pooled @ (scores - mean_score) ** 2
     if var_score <= 0:
-        return 1.0, 0.0
+        return np.nan, 0.0
 
     z = (late @ scores - n_late * mean_score) / np.sqrt(n_early * n_late / (n - 1) * var_score)
     return float(stats.norm.sf(z * expected_sign)), shift
@@ -157,11 +160,15 @@ def stance_table(counts: pl.DataFrame):
 def compute_target_significance(
     stance_counts: pl.DataFrame,
     expected_signs: dict,
+    alpha: float = 0.05,
     min_observations: int = 10
 ) -> pl.DataFrame:
     """Test each target's stance shift in the direction its loading predicts.
 
-    Targets with fewer than min_observations in either period get p_value=1.0.
+    One family per block of movers: every heavy target the block is read on is
+    one test, and the handful the table keeps are the survivors of a hundred,
+    so they are corrected together. Targets with fewer than min_observations in
+    either period are not tested and hold no place in the family.
     """
     results = []
 
@@ -174,15 +181,20 @@ def compute_target_significance(
         total_late = late['len'].sum() if late.height > 0 else 0
 
         if total_early < min_observations or total_late < min_observations:
-            results.append({'Target': target, 'p_value': 1.0, 'stance_shift': 0.0})
+            results.append({'Target': target, 'p_value': np.nan, 'stance_shift': 0.0})
             continue
 
         table, all_stances, _, _ = stance_table(target_data)
         p_value, shift = directional_stance_shift(table, all_stances, expected_signs[target])
         results.append({'Target': target, 'p_value': p_value, 'stance_shift': shift})
 
-    return pl.DataFrame(results, schema={'Target': pl.Utf8, 'p_value': pl.Float64,
-                                         'stance_shift': pl.Float64})
+    df = pl.DataFrame(results, schema={'Target': pl.Utf8, 'p_value': pl.Float64,
+                                       'stance_shift': pl.Float64})
+    q_values, significant = benjamini_hochberg(df['p_value'].to_numpy(), alpha=alpha)
+    return df.with_columns([
+        pl.Series('q_value', q_values),
+        pl.Series('significant', significant),
+    ])
 
 
 def compute_stance_changes_for_user(
@@ -193,10 +205,14 @@ def compute_stance_changes_for_user(
     targets: list,
     filter_col: str,
     movement_direction: str = 'positive',
-    significance_threshold: float = 0.05,
     min_observations: int = 5
 ) -> dict:
-    """Compute stance changes for a user, pooled by target loading direction (positive vs negative)."""
+    """Compute stance changes for a user, pooled by target loading direction.
+
+    Every pooled test is returned, significant or not: the candidates are one
+    family, and which of them survives is decided over the whole pool by the
+    caller rather than user by user.
+    """
     midpoint = start_date + (end_date - start_date) / 2
     target_names = [t['target'] for t in targets]
     target_info_df = pl.DataFrame(targets).rename({'target': 'Target'})
@@ -245,9 +261,6 @@ def compute_stance_changes_for_user(
         # favour as its mover travels the positive way along it, and vice versa
         expected_sign = movement_sign * (1 if loading_dir == 'positive' else -1)
         p_value, shift = directional_stance_shift(table, all_stances, expected_sign)
-
-        if p_value >= significance_threshold:
-            continue
 
         # Compute percentages
         stance_changes = {}
@@ -349,7 +362,8 @@ def compute_aggregate_stance_changes(
     movement_sign = 1 if movement_direction == 'positive' else -1
     expected_signs = {t['target']: movement_sign * (1 if t['loading'] > 0 else -1)
                       for t in targets}
-    significance_df = compute_target_significance(stance_counts, expected_signs, min_observations)
+    significance_df = compute_target_significance(stance_counts, expected_signs,
+                                                  significance_threshold, min_observations)
 
     # Rank on how far the stances actually moved, weighted by the same score
     # that picked the heavy-loading targets in the first place: ranking on
@@ -363,7 +377,7 @@ def compute_aggregate_stance_changes(
         ]) \
         .filter((pl.col('total_early') > 0) & (pl.col('total_late') > 0)) \
         .join(significance_df, on='Target') \
-        .filter(pl.col('p_value') < significance_threshold) \
+        .filter(pl.col('significant')) \
         .join(target_info_df.select(['Target', 'loading', 'rank_score']), on='Target') \
         .sort(pl.col('rank_score') * pl.col('stance_shift').abs(), descending=True) \
         .head(n_top_targets)
@@ -372,14 +386,15 @@ def compute_aggregate_stance_changes(
         return {}
 
     top_changes = changes_df \
-        .join(valid_targets.select(['Target', 'total_early', 'total_late', 'p_value', 'stance_shift']), on='Target') \
+        .join(valid_targets.select(['Target', 'total_early', 'total_late', 'p_value',
+                                    'q_value', 'stance_shift']), on='Target') \
         .join(target_info_df, on='Target')
 
     results = {}
     for target in valid_targets['Target'].to_list():
         target_rows = top_changes.filter(pl.col('Target') == target)
         target_info = target_rows.select(['loading', 'direction', 'total_early', 'total_late',
-                                          'p_value', 'stance_shift']).row(0, named=True)
+                                          'p_value', 'q_value', 'stance_shift']).row(0, named=True)
 
         stance_changes = {}
         for row in target_rows.iter_rows(named=True):
@@ -396,6 +411,7 @@ def compute_aggregate_stance_changes(
             'early_n': target_info['total_early'],
             'late_n': target_info['total_late'],
             'p_value': target_info['p_value'],
+            'q_value': target_info['q_value'],
             'stance_shift': target_info['stance_shift']
         }
 
@@ -416,7 +432,8 @@ def analyze_dimension_movements(
     percentiles: list = [0.01, 0.10],
     per_year: bool = True,
     axis_prefix: str = 'LD',
-    target_weights: np.ndarray = None
+    target_weights: np.ndarray = None,
+    significance_threshold: float = 0.05
 ):
     """Analyze movement patterns across dimensions, time periods, and directions."""
     results = {}
@@ -461,7 +478,10 @@ def analyze_dimension_movements(
                 # pooled stance changes, then keep top N by movement
                 candidates = get_top_movers(period_movement, direction, n_candidate_movers)
 
-                movers_info = []
+                # The whole pool is screened before any of it is kept: the
+                # movers on the page are the survivors of fifty candidates
+                # tested on both loading pools, so that is the family.
+                scanned = []
                 for row in candidates.iter_rows(named=True):
                     stance_changes = compute_stance_changes_for_user(
                         text_df,
@@ -472,6 +492,23 @@ def analyze_dimension_movements(
                         filter_col,
                         movement_direction=direction
                     )
+                    scanned.extend((row['filter_value'], label, group)
+                                   for label, group in stance_changes.items())
+
+                q_values, keep = benjamini_hochberg(
+                    np.array([group['p_value'] for _, _, group in scanned]),
+                    alpha=significance_threshold)
+
+                survivors = {}
+                for (filter_value, label, group), q, ok in zip(scanned, q_values, keep):
+                    if not ok:
+                        continue
+                    group['q_value'] = float(q)
+                    survivors.setdefault(filter_value, {})[label] = group
+
+                movers_info = []
+                for row in candidates.iter_rows(named=True):
+                    stance_changes = survivors.get(row['filter_value'])
                     if not stance_changes:
                         continue
 
@@ -494,7 +531,8 @@ def analyze_dimension_movements(
                     pct_label = f'top_{int(pct * 100)}pct'
                     agg_stance_changes = compute_aggregate_stance_changes(
                         text_df, pct_movers, heavy_targets, filter_col,
-                        movement_direction=direction
+                        movement_direction=direction,
+                        significance_threshold=significance_threshold
                     )
                     results[dim_name][period_key][f'{direction}_{pct_label}'] = {
                         'n_users': pct_movers.height,
@@ -582,7 +620,7 @@ def print_analysis_results(results: dict, title: str = None):
                     if stance_changes:
                         print(f"    Top significant stance changes (pooled across group):")
                         for target, target_data in stance_changes.items():
-                            print(f"      {target} (loading={target_data['loading']:.4f}, n_early={target_data['early_n']}, n_late={target_data['late_n']}, shift={target_data['stance_shift']:+.3f}, p={target_data['p_value']:.4f}):")
+                            print(f"      {target} (loading={target_data['loading']:.4f}, n_early={target_data['early_n']}, n_late={target_data['late_n']}, shift={target_data['stance_shift']:+.3f}, q={target_data['q_value']:.4f}):")
                             for stance in sorted(target_data['stance_changes'], key=lambda s: (STANCE_ORDER.index(s) if s in STANCE_ORDER else len(STANCE_ORDER))):
                                 change_data = target_data['stance_changes'][stance]
                                 change_str = f"+{change_data['change']:.1f}" if change_data['change'] >= 0 else f"{change_data['change']:.1f}"
