@@ -139,3 +139,15 @@ for name, e in ev.items():
     print(f"{name}: {int(e['n'].sum()):,} posts in {len(e['n']):,} cells, "
           f"uncertainty neu {score_of[name]['neutrality']['unc']:.5f} "
           f"pol {score_of[name]['polarity']['unc']:.5f}")
+
+# RES is discrimination and UNC is the most any forecast of these labels could
+# resolve, so the ratio is the share of achievable discrimination reached. It
+# carries no calibration term, which is why it is readable where the skill
+# scores above are not.
+print(f"\n{'holdout':18} {'polarity':>10} {'neutrality':>12}   "
+      "(RES / UNC: share of achievable discrimination)")
+print('-' * 72)
+for name in ev:
+    s = score_of[name]
+    print(f"{name:18} {s['polarity']['res'] / s['polarity']['unc']:10.1%} "
+          f"{s['neutrality']['res'] / s['neutrality']['unc']:12.1%}")
