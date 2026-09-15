@@ -45,8 +45,15 @@ def table_start(n_dims, prefix):
 
 
 def cell(d, strongest):
-    """One effect size, the row's largest one in bold."""
-    return f"$\\mathbf{{{d:+.2f}}}$" if strongest else f"${d:+.2f}$"
+    """One effect size, the row's largest one in bold.
+
+    One decimal, which is as fine as the interval behind it justifies and is
+    what keeps the table inside a single column. A separation that rounds away
+    loses its sign with it, rather than claiming a direction at the second
+    decimal that the column does not show.
+    """
+    body = f"{abs(d):.1f}" if abs(round(d, 1)) == 0 else f"{d:+.1f}"
+    return f"$\\mathbf{{{body}}}$" if strongest else f"${body}$"
 
 
 @hydra.main(version_base=None, config_path="../../config", config_name="config")
