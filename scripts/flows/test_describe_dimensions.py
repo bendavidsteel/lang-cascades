@@ -103,3 +103,38 @@ def test_an_axis_with_no_labels_keeps_its_own_ticks():
     plot_nn_potential = pytest.importorskip('plot_nn_potential')
 
     assert plot_nn_potential.axis_tick_labels({}, 0) == ([], [])
+
+
+def test_the_snapshots_span_the_fit_period_not_a_hardcoded_run_of_years():
+    import datetime
+
+    plot_nn_potential = pytest.importorskip('plot_nn_potential')
+    splits = pytest.importorskip('splits')
+
+    spec = splits.SplitSpec(365, 0, 0.70, 0.10, 42)
+    times = pl.Series([datetime.datetime(2022, 1, 8) + datetime.timedelta(days=16 * i)
+                       for i in range(103)])
+
+    spans = plot_nn_potential.training_years(times, spec)
+
+    # every year the fit period touches, with the last one clipped where the
+    # holdout begins rather than running into data the model never saw
+    assert [y for y, _, _ in spans] == [2022, 2023, 2024, 2025]
+    assert spans[0][1] == datetime.datetime(2022, 1, 8)
+    assert spans[-1][2] == splits.time_cutoff(times, spec)
+
+
+def test_a_year_the_fit_period_barely_touches_gets_no_panel():
+    import datetime
+
+    plot_nn_potential = pytest.importorskip('plot_nn_potential')
+    splits = pytest.importorskip('splits')
+
+    spec = splits.SplitSpec(365, 0, 0.70, 0.10, 42)
+    # the fit period ends 2023-02-14, six weeks into 2023
+    times = pl.Series([datetime.datetime(2022, 1, 1),
+                       datetime.datetime(2024, 2, 14)])
+
+    spans = plot_nn_potential.training_years(times, spec)
+
+    assert [y for y, _, _ in spans] == [2022]

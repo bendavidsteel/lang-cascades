@@ -19,6 +19,7 @@ from plnn.models import DeepTimePhiPLNN
 from plnn.pl.plot_plnn import compute_grad_phi
 
 import latent_space
+import splits
 import sweep_runs
 from nn_potential import INITIAL_DATE, UNIT_DAYS, run_dir
 from pca_density import create_kde_background, get_top_component_features, format_pca_axis_label
@@ -157,6 +158,25 @@ def axis_tick_labels(dimension_labels, dim):
         if key in bands and at in bands:
             ticks.append((bands[at], bands[key]))
     return [t[0] for t in ticks], [t[1] for t in ticks]
+
+
+def training_years(times, spec, min_overlap_days=90):
+    """Calendar years to snapshot, and the span of each inside the fit period.
+
+    The panels cover the period the landscape was fitted on, which ends where
+    the holdout begins -- a year is included when enough of it falls before the
+    cutoff to be worth a panel, and its span is clipped there rather than
+    running into data the model never saw.
+    """
+    start = min(times) if not isinstance(times, pl.Series) else times.min()
+    cutoff = splits.time_cutoff(times, spec)
+    out = []
+    for year in range(start.year, cutoff.year + 1):
+        lo = max(start, datetime.datetime(year, 1, 1))
+        hi = min(cutoff, datetime.datetime(year, 12, 31))
+        if (hi - lo).days >= min_overlap_days:
+            out.append((year, lo, hi))
+    return out
 
 
 def show_x_dim_labels(ax, dimension_labels, dim):
@@ -754,8 +774,11 @@ def main(cfg):
     
 
     if 'time_snapshots' in plots:
-        years = [2023, 2024, 2025]
-        fig, axes = plt.subplots(1, 3, figsize=(12, 4.5))
+        spans = training_years(target_df['createtime'], splits.SplitSpec.from_cfg(cfg))
+        years = [y for y, _, _ in spans]
+        print(f'time snapshots: {years} (the fit period, to '
+              f'{spans[-1][2]:%Y-%m-%d})', flush=True)
+        fig, axes = plt.subplots(1, len(years), figsize=(4 * len(years), 4.5))
 
         # Pre-compute flow magnitudes across all years for global linewidth normalization
         all_flow_magnitudes = []
@@ -763,8 +786,9 @@ def main(cfg):
         x = np.linspace(*plot_kwargs['xrange'], spatial_res, dtype=np.float64)
         y = np.linspace(*plot_kwargs['yrange'], spatial_res, dtype=np.float64)
         xs, ys = np.meshgrid(x, y)
-        for yr in tqdm(years, desc="Pre-computing flow (time)"):
-            t_range = (datetime.datetime(yr, 1, 1) - INITIAL_DATE).days / UNIT_DAYS, (datetime.datetime(yr, 12, 31) - INITIAL_DATE).days / UNIT_DAYS
+        for _, lo, hi in tqdm(spans, desc="Pre-computing flow (time)"):
+            t_range = ((lo - INITIAL_DATE).days / UNIT_DAYS,
+                       (hi - INITIAL_DATE).days / UNIT_DAYS)
             t_mid = (t_range[0] + t_range[1]) / 2.0
             mag, _ = compute_flow_magnitude(
                 model, t_mid, xs, ys,
@@ -782,8 +806,9 @@ def main(cfg):
         global_p75 = np.percentile(all_mags, 75)
         global_max = all_mags.max()
 
-        for i, yr in enumerate(tqdm(years, desc="Plotting time snapshots")):
-            t_range = (datetime.datetime(yr, 1, 1) - INITIAL_DATE).days / UNIT_DAYS, (datetime.datetime(yr, 12, 31) - INITIAL_DATE).days / UNIT_DAYS
+        for i, (yr, lo, hi) in enumerate(tqdm(spans, desc="Plotting time snapshots")):
+            t_range = ((lo - INITIAL_DATE).days / UNIT_DAYS,
+                       (hi - INITIAL_DATE).days / UNIT_DAYS)
             plot_kwargs['t_range'] = t_range
             plot_kwargs['show_colorbar'] = False
             plot_kwargs['max_flow'] = global_max
@@ -800,7 +825,8 @@ def main(cfg):
             plot_kwargs['show_kde'] = False
             plot_kwargs['show_hatching'] = False
             plot_density_streamplot(fig, axes[i], model, target_df, components, stance_cols, **plot_kwargs)
-            axes[i].set_title(f'{t_to_datetime(t_range[0]).strftime("%Y")}')
+            partial = (lo.month, lo.day) != (1, 1) or (hi.month, hi.day) != (12, 31)
+            axes[i].set_title(f'{yr} ({lo:%b}--{hi:%b})' if partial else f'{yr}')
 
         fig.subplots_adjust(
             left=0.05,
